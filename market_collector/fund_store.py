@@ -144,6 +144,13 @@ class FundStore:
 )"""
                 )
                 cur.execute(
+                    """CREATE TABLE IF NOT EXISTS fund_limit_overview_snapshot (
+  snapshot_key VARCHAR(32) NOT NULL PRIMARY KEY,
+  payload JSON NULL,
+  updated_at VARCHAR(35) NULL
+)"""
+                )
+                cur.execute(
                     """CREATE TABLE IF NOT EXISTS fund_quote (
   code VARCHAR(16) NOT NULL PRIMARY KEY,
   name VARCHAR(128) NULL,
@@ -163,6 +170,7 @@ class FundStore:
   quote_date VARCHAR(10) NULL,
   as_of VARCHAR(35) NULL,
   session VARCHAR(16) NULL,
+  suspended TINYINT(1) NOT NULL DEFAULT 0,
   updated_at VARCHAR(35) NULL,
   KEY idx_change_percent (change_percent),
   KEY idx_updated_at (updated_at)
@@ -266,11 +274,87 @@ class FundStore:
                 _date_str(r.get("quoteDate")),
                 r.get("asOf") or r.get("collected_at"),
                 r.get("session"),
+                1 if r.get("suspended") else 0,
                 now,
             ))
-        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,total_shares,market_capital,market_state,quote_date,as_of,session,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),total_shares=VALUES(total_shares),market_capital=VALUES(market_capital),market_state=VALUES(market_state),quote_date=VALUES(quote_date),as_of=VALUES(as_of),session=VALUES(session),updated_at=VALUES(updated_at)"""
+        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,total_shares,market_capital,market_state,quote_date,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),total_shares=VALUES(total_shares),market_capital=VALUES(market_capital),market_state=VALUES(market_state),quote_date=VALUES(quote_date),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
         return self._safe_executemany(sql, mapped, "fund_quote")
+
+    def upsert_quotes_fast(self, rows: Sequence[dict[str, Any]]) -> int:
+        """高频写入专用：每次新建 autocommit=True 独立连接，避免单例连接的 commit 在跨线程/跨连接场景下不生效。
+
+        单例 _conn (autocommit=False) 在高频多线程场景下，commit 会出现“同连接读己写可见、跨连接不可见”的状态——
+        表现是 upsert 返回行数但外部读不到 updated_at 变化。autocommit 独立连接每条语句即时提交，跨连接立即可见。
+        代价是每秒建/关一次连接，TiDB Cloud 短连接开销可接受（<50ms）。
+        """
+        if not rows or not self._targets:
+            return 0
+        now = _shanghai_iso(datetime.now(timezone.utc))
+        mapped = []
+        for r in rows:
+            code = str(r.get("code") or r.get("symbol") or "").strip()
+            if not code:
+                continue
+            mapped.append((
+                code, r.get("name"), _num(r.get("price")),
+                _num(r.get("latestNav") or r.get("navBase")),
+                _date_str(r.get("latestNavDate")),
+                _num(r.get("previousClose") or r.get("previous_close")),
+                _num(r.get("change")),
+                _num(r.get("changePercent") or r.get("change_percent")),
+                _num(r.get("premiumPercent") or r.get("premium_percent")),
+                _num(r.get("iopv")),
+                _num(r.get("volume")),
+                _num(r.get("turnover")),
+                _num(r.get("totalShares")),
+                _num(r.get("marketCapital")),
+                str(r.get("marketState") or "").strip() or None,
+                _date_str(r.get("quoteDate")),
+                r.get("asOf") or r.get("collected_at"),
+                r.get("session"),
+                1 if r.get("suspended") else 0,
+                now,
+            ))
+        if not mapped:
+            return 0
+        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,total_shares,market_capital,market_state,quote_date,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),total_shares=VALUES(total_shares),market_capital=VALUES(market_capital),market_state=VALUES(market_state),quote_date=VALUES(quote_date),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
+        target = self._targets[0]
+        import pymysql
+        password = ""
+        pw_file = str(target.get("password_file") or "").strip()
+        pw_env = str(target.get("password_env") or "").strip()
+        if pw_env:
+            password = os.environ.get(pw_env, "")
+        if not password and pw_file:
+            password = Path(pw_file).read_text(encoding="utf-8").strip()
+        conn = None
+        try:
+            conn = pymysql.connect(
+                host=str(target.get("host") or "").strip(),
+                port=int(target.get("port") or 4000),
+                user=str(target.get("user") or "").strip(),
+                password=password,
+                database=str(target.get("database") or "ai_dca_market"),
+                ssl_verify_cert=True, ssl_verify_identity=True,
+                ssl_ca=str(target.get("ssl_ca") or "/etc/ssl/certs/ca-certificates.crt"),
+                connect_timeout=8, read_timeout=15, write_timeout=15,
+                autocommit=True, charset="utf8mb4",
+            )
+            with conn.cursor() as cur:
+                for i in range(0, len(mapped), 50):
+                    cur.executemany(sql, list(mapped[i:i + 50]))
+            return len(mapped)
+        except Exception as exc:
+            print(f"[fund-store] fund_quote fast write failed: {exc}", flush=True)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     # ---- fund_detail ----
     def upsert_details(self, rows: Sequence[dict[str, Any]]) -> int:
@@ -356,6 +440,35 @@ ON DUPLICATE KEY UPDATE latest_nav=VALUES(latest_nav),return_1w=VALUES(return_1w
         except Exception as exc:
             print(f"[fund-store] read_history {code} failed: {exc}", flush=True)
             return []
+
+    # ---- 场外限额聚合快照（单行 global，来自 ocr-proxy）----
+    def upsert_limit_overview(self, payload: dict[str, Any]) -> int:
+        now = _shanghai_iso(datetime.now(timezone.utc))
+        conn = None
+        try:
+            conn = self._tidb()
+        except Exception as exc:
+            print(f"[fund-store] upsert_limit_overview tidb failed: {exc}", flush=True)
+            return 0
+        if conn is None:
+            return 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO fund_limit_overview_snapshot (snapshot_key, payload, updated_at)
+                       VALUES ('global', %s, %s)
+                       ON DUPLICATE KEY UPDATE payload=VALUES(payload), updated_at=VALUES(updated_at)""",
+                    (_json_or_none(payload), now),
+                )
+            conn.commit()
+            return cur.rowcount or 1
+        except Exception as exc:
+            print(f"[fund-store] upsert_limit_overview failed: {exc}", flush=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return 0
 
 
 def build_fund_store(config: dict[str, Any]) -> FundStore | None:

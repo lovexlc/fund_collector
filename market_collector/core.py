@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import threading
 import time
 from datetime import datetime, timedelta, time as day_time, timezone
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .calendar_cn import is_trading_day
-from .fund_reference import fetch_fund_references
+from .fund_reference import fetch_fund_references, fetch_fund_limit_overview
 from .otc import OTC_SYMBOLS, atomic_write_json, fetch_otc_metrics
 from .publish import build_publisher
 from .sources import fetch_eastmoney_references, fetch_tencent_quotes, isoformat_z, normalize_symbol
@@ -182,6 +183,7 @@ def build_symbol_record(
         "volume": (price_row or {}).get("volume"),
         "turnover": (price_row or {}).get("turnover"),
         "turnover_rate": (price_row or {}).get("turnover_rate"),
+        "suspended": bool((price_row or {}).get("suspended")),
         "iopv": iopv,
         "computed_premium_percent": computed_premium,
         "vendor_premium_percent": vendor_premium,
@@ -217,6 +219,15 @@ class MarketCollector:
         self._fund_reference_completed_dates: set[str] = set()
         self._daily_kline_completed_dates: set[str] = set()
         self._data_service: MarketDataService | None = None
+        # 高频行情：场内 ETF price 每 1s 刷新、iopv 每 5s 刷新，各自独立线程。
+        # iopv 缓存由低频线程写入，高频线程读取后计算 premium_percent 写 fund_quote。
+        self._iopv_cache: dict[str, dict[str, Any]] = {}
+        self._iopv_lock = threading.Lock()
+        self._high_freq_stop = threading.Event()
+        # 高频写入用持久 autocommit 连接（executemany 在多行 + ON DUPLICATE KEY UPDATE
+        # 场景下 TiDB 不生效，改 execute 逐行提交；复用连接避免每秒建连开销）。
+        self._high_freq_conn: Any = None
+        self._high_freq_conn_lock = threading.Lock()
         from .fund_store import build_fund_store, FundStore
         self.fund_store: FundStore | None = build_fund_store(config)
         if self.fund_store is not None:
@@ -381,6 +392,7 @@ class MarketCollector:
                     "volume": fm.get("volume"),
                     "turnover": fm.get("turnover"),
                     "marketState": fm.get("marketState"),
+                    "suspended": fm.get("suspended"),
                     "asOf": fm.get("asOf"),
                     "session": "exchange",
                 })
@@ -444,6 +456,20 @@ class MarketCollector:
                 "fund_size": fee.get("fundSize"),
             })
         return self.fund_store.upsert_details(rows)
+
+    def _publish_limit_overview(self) -> int:
+        """每日：从 ocr-proxy 拉场外限额聚合快照（含事件/趋势）写入 fund_limit_overview_snapshot。"""
+        if self.fund_store is None:
+            return 0
+        sync_config = self.config.get("fund_reference_sync") or {}
+        worker_url = str(sync_config.get("worker_url") or "https://api.freebacktrack.tech")
+        timeout = float(sync_config.get("request_timeout_sec") or 25)
+        try:
+            payload = fetch_fund_limit_overview(worker_url, timeout)
+        except Exception as exc:
+            print(f"[fund-store] fetch_fund_limit_overview failed: {exc}", flush=True)
+            return 0
+        return self.fund_store.upsert_limit_overview(payload)
 
     def _fetch_nav_history_rows(self, codes: list[str]) -> list[dict[str, Any]]:
         """拉历史净值 K 线（增量，只取最近未入库的）。"""
@@ -573,7 +599,185 @@ class MarketCollector:
         sum_n = self.fund_store.upsert_summaries(summary_rows)
         return hist_n, sum_n
 
+    # ── 高频行情线程 ──
+    def _refresh_iopv_cache(self) -> int:
+        """低频线程：拉 eastmoney iopv，更新缓存（5s 一次）。返回命中数。"""
+        symbols = list(self.config["symbols"])
+        timeout = float(self.config.get("request_timeout_sec") or 10)
+        try:
+            iopv_map, _ = fetch_eastmoney_references(symbols, timeout)
+        except Exception as exc:
+            print(f"[high-freq] iopv fetch failed: {exc}", flush=True)
+            return 0
+        with self._iopv_lock:
+            for symbol in symbols:
+                row = iopv_map.get(symbol) or {}
+                if row.get("iopv") is not None:
+                    self._iopv_cache[symbol] = row
+        return len(iopv_map)
+
+    def _high_freq_publish_quotes(self) -> int:
+        """高频线程：tencent 拉价 + 读 iopv 缓存 + 算 premium，upsert fund_quote（1s 一次）。"""
+        if self.fund_store is None:
+            return 0
+        symbols = list(self.config["symbols"])
+        timeout = float(self.config.get("request_timeout_sec") or 10)
+        collected_at = isoformat_z(datetime.now(timezone.utc))
+        try:
+            price_map = fetch_tencent_quotes(symbols, timeout)
+        except Exception as exc:
+            print(f"[high-freq] tencent fetch failed: {exc}", flush=True)
+            return 0
+        iopv_snapshot: dict[str, dict[str, Any]] = {}
+        with self._iopv_lock:
+            iopv_snapshot = dict(self._iopv_cache)
+        rows: list[dict[str, Any]] = []
+        for symbol in symbols:
+            pr = price_map.get(symbol) or {}
+            if not pr.get("price"):
+                continue
+            ir = iopv_snapshot.get(symbol) or {}
+            price = pr.get("price")
+            iopv = ir.get("iopv")
+            premium_percent = None
+            if iopv and math.isfinite(iopv) and iopv > 0 and math.isfinite(price) and price > 0:
+                premium_percent = round((price / iopv - 1) * 100, 4)
+            elif ir.get("vendor_premium_percent") is not None:
+                premium_percent = ir.get("vendor_premium_percent")
+            rows.append({
+                "code": symbol,
+                "name": pr.get("name") or symbol,
+                "price": price,
+                "latestNav": None,
+                "latestNavDate": None,
+                "previousClose": pr.get("previous_close"),
+                "changePercent": pr.get("change_percent"),
+                "premiumPercent": premium_percent,
+                "iopv": iopv,
+                "volume": pr.get("volume"),
+                "turnover": pr.get("turnover"),
+                "marketState": "OPEN",
+                "asOf": collected_at,
+                "session": "exchange",
+                "suspended": bool(pr.get("suspended")),
+            })
+        if not rows:
+            return 0
+        return self._upsert_quotes_fast(rows)
+
+    def _upsert_quotes_fast(self, rows: list[dict[str, Any]]) -> int:
+        """高频写入：完全独立于 fund_store，直接从 config 读 TiDB target 建连接。
+
+        fund_store.initialize() 会建立 autocommit=False 的连接并污染同用户会话状态，
+        导致后续新建的 autocommit=True 连接写入无法跨连接可见（同连接可读、跨连接不可见）。
+        本方法不依赖 self.fund_store，避免污染。
+        """
+        import pymysql
+        import os
+        from .fund_store import _shanghai_iso, _num, _date_str
+        storage_cfg = (self.config.get("storage") or {}).get("tidb") or self.config.get("tidb") or {}
+        raw_targets = storage_cfg.get("targets") or []
+        if not raw_targets:
+            return 0
+        target = raw_targets[0]
+        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,total_shares,market_capital,market_state,quote_date,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),total_shares=VALUES(total_shares),market_capital=VALUES(market_capital),market_state=VALUES(market_state),quote_date=VALUES(quote_date),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
+        import pymysql
+        import os
+        from .fund_store import _shanghai_iso, _num, _date_str
+        now = _shanghai_iso(datetime.now(timezone.utc))
+        mapped = []
+        for r in rows:
+            code = str(r.get("code") or r.get("symbol") or "").strip()
+            if not code:
+                continue
+            mapped.append((
+                code, r.get("name"), _num(r.get("price")),
+                _num(r.get("latestNav") or r.get("navBase")),
+                _date_str(r.get("latestNavDate")),
+                _num(r.get("previousClose") or r.get("previous_close")),
+                _num(r.get("change")),
+                _num(r.get("changePercent") or r.get("change_percent")),
+                _num(r.get("premiumPercent") or r.get("premium_percent")),
+                _num(r.get("iopv")),
+                _num(r.get("volume")),
+                _num(r.get("turnover")),
+                _num(r.get("totalShares")),
+                _num(r.get("marketCapital")),
+                str(r.get("marketState") or "").strip() or None,
+                _date_str(r.get("quoteDate")),
+                r.get("asOf") or r.get("collected_at"),
+                r.get("session"),
+                1 if r.get("suspended") else 0,
+                now,
+            ))
+        if not mapped:
+            return 0
+        password = ""
+        pw_file = str(target.get("password_file") or "").strip()
+        pw_env = str(target.get("password_env") or "").strip()
+        if pw_env:
+            password = os.environ.get(pw_env, "")
+        if not password and pw_file:
+            password = Path(pw_file).read_text(encoding="utf-8").strip()
+        conn = None
+        try:
+            conn = pymysql.connect(
+                host=target["host"],
+                port=int(target.get("port") or 4000),
+                user=target["user"],
+                password=password,
+                database=target.get("database") or "ai_dca_market",
+                ssl_verify_cert=True,
+                ssl_verify_identity=True,
+                ssl_ca=target.get("ssl_ca") or "/etc/ssl/certs/ca-certificates.crt",
+                autocommit=True,
+                charset="utf8mb4",
+            )
+            with conn.cursor() as cur:
+                for row in mapped:
+                    cur.execute(sql, row)
+            return len(mapped)
+        except Exception as exc:
+            print(f"[high-freq] write failed: {exc}", flush=True)
+            return 0
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _iopv_loop(self) -> None:
+        """低频线程主循环：交易时段每 5s 刷新 iopv 缓存。"""
+        while not self._high_freq_stop.is_set():
+            now = datetime.now(timezone.utc)
+            if classify_session(now) == "trading":
+                try:
+                    self._refresh_iopv_cache()
+                except Exception as exc:
+                    print(f"[high-freq] iopv loop error: {exc}", flush=True)
+            self._high_freq_stop.wait(5.0)
+
+    def _quote_loop(self) -> None:
+        """高频线程主循环：交易时段每 1s 刷新 fund_quote。"""
+        while not self._high_freq_stop.is_set():
+            now = datetime.now(timezone.utc)
+            if classify_session(now) == "trading":
+                t0 = time.time()
+                try:
+                    n = self._high_freq_publish_quotes()
+                    print(f"[quote-beat] upsert={n} dt={time.time()-t0:.2f}s {isoformat_z(now)}", flush=True)
+                except Exception as exc:
+                    print(f"[high-freq] quote loop error: {exc}", flush=True)
+            self._high_freq_stop.wait(1.0)
+
     def run_forever(self) -> None:
+        # 高频行情线程：quote 1s / iopv 5s，仅在交易时段运行
+        quote_thread = threading.Thread(target=self._quote_loop, name="high-freq-quote", daemon=True)
+        iopv_thread = threading.Thread(target=self._iopv_loop, name="high-freq-iopv", daemon=True)
+        quote_thread.start()
+        iopv_thread.start()
         while True:
             now = datetime.now(timezone.utc)
             otc_payload = self.run_due_otc(now)
@@ -589,20 +793,13 @@ class MarketCollector:
                 # 晚间费率/限额同步后：更新 fund_detail + fund_history/summary
                 try:
                     dn = self._publish_details()
+                    lo = self._publish_limit_overview()
                     _hn, sn = self._publish_history_and_summary()
-                    print(f"[fund-store] daily: detail={dn} summary={sn}", flush=True)
+                    print(f"[fund-store] daily: detail={dn} limit={lo} summary={sn}", flush=True)
                 except Exception as exc:
                     print(f"[fund-store] daily failed: {exc}", flush=True)
             session = classify_session(now)
-            now_sh = now.astimezone(SHANGHAI)
-            # 5 分钟边界：盘中实时行情写 fund_quote
-            if now_sh.minute % 5 == 0:
-                try:
-                    n = self._publish_quotes()
-                    if n:
-                        print(f"[fund-store] intraday quote={n} at {isoformat_z(now)}", flush=True)
-                except Exception as exc:
-                    print(f"[fund-store] intraday failed: {exc}", flush=True)
+            # 历史留档 + publisher latest.json（不影响高频 fund_quote）
             schedule = ((self.config.get("schedules") or {}).get(session)) or {}
             interval_sec = max(1, int(schedule.get("interval_sec") or 60))
             enabled = schedule.get("enabled", True) is not False
