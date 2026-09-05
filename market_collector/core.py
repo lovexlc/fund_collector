@@ -21,8 +21,8 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 SYMBOLS = [
     "513870", "513390", "513300", "513110", "513100", "159941", "159696", "159660",
-    "159659", "159632", "159513", "159509", "159501", "159577", "161128", "161130",
-    "513500", "513650", "159612", "159655", "513850",
+    "159659", "159632", "159513", "159509", "159501", "159577", "161125", "161128", "161130",
+    "513500", "513650", "159612", "159655", "513850", "563020",
 ]
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -151,6 +151,9 @@ def build_symbol_record(
     iopv = iopv_row.get("iopv") if iopv_row else None
     vendor_premium = iopv_row.get("vendor_premium_percent") if iopv_row else None
     computed_premium = compute_premium(price, iopv)
+    # LOF 无盘中 IOPV，computed_premium 为 null；fallback 到基金公司公布的场内折溢价率（f402）。
+    if computed_premium is None and vendor_premium is not None:
+        computed_premium = vendor_premium
     mismatch_pp = round(abs(computed_premium - vendor_premium), 4) if computed_premium is not None and vendor_premium is not None else None
     quality_issues: list[str] = []
     if price is None:
@@ -444,6 +447,11 @@ class MarketCollector:
                 "buy_status": lim.get("buyStatus"),
                 "buy_status_text": lim.get("buyStatusText"),
                 "max_purchase_per_day": lim.get("maxPurchasePerDay"),
+                "channel_limits": lim.get("channelLimits") or {},
+                "limit_channel": lim.get("limitChannel"),
+                "limit_channel_text": lim.get("limitChannelText"),
+                "limit_schema_version": lim.get("limitSchemaVersion") or 2,
+                "currency": lim.get("currency") or "CNY",
                 "min_purchase": lim.get("minPurchase"),
                 "confirm_days": lim.get("confirmDays"),
                 "management_fee_rate": fee.get("managementFeeRate"),
@@ -457,6 +465,147 @@ class MarketCollector:
             })
         return self.fund_store.upsert_details(rows)
 
+
+    def _build_limit_events_from_snapshots(self, days: int = 30, name_map: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        """用 collector 自己的 fund_limit 历史快照生成有金额变化的 events。
+
+        ocr-proxy 的 diff 依赖 KV 里 previous/current 两个快照，cron 时序或 KV 过期
+        会导致 tighten/relax 事件丢失；且其 scope_changed 事件无金额，对用户无意义。
+        collector 每日存 fund_limit 快照（fund_reference_snapshots 表），有完整历史，
+        可以可靠地 diff 出每只基金的限额变化轨迹。
+        """
+        if self.store is None:
+            return []
+        names = name_map or {}
+        try:
+            history = self.store.read_fund_reference_history('fund_limit', days)
+        except Exception as exc:
+            print(f"[fund-store] read_fund_reference_history failed: {exc}", flush=True)
+            return []
+        if not history:
+            return []
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for row in history:
+            sym = str(row.get('symbol') or '')
+            if not sym:
+                continue
+            by_symbol.setdefault(sym, []).append({
+                'date': str(row.get('snapshot_date') or ''),
+                'payload': row.get('payload') or {},
+            })
+        events: list[dict[str, Any]] = []
+        for symbol, rows in by_symbol.items():
+            rows.sort(key=lambda r: r['date'])
+            for i in range(1, len(rows)):
+                prev = rows[i - 1]
+                curr = rows[i]
+                prev_p = prev['payload']
+                curr_p = curr['payload']
+                prev_status = str(prev_p.get('buyStatus') or '').lower()
+                curr_status = str(curr_p.get('buyStatus') or '').lower()
+                prev_amount = None if prev_status == 'suspended' else self._finite_money(prev_p.get('maxPurchasePerDay'))
+                curr_amount = None if curr_status == 'suspended' else self._finite_money(curr_p.get('maxPurchasePerDay'))
+                currency = str(curr_p.get('currency') or prev_p.get('currency') or 'CNY').upper()
+                fund_name = names.get(symbol) or str(curr_p.get('name') or curr_p.get('fundName') or symbol)
+                effective_at = curr_p.get('effectiveDate') or curr.get('date') or None
+                observed_at = curr.get('date') or None
+                if prev_amount is not None and curr_amount is not None and prev_amount != curr_amount:
+                    etype = 'tighten' if curr_amount < prev_amount else 'relax'
+                    events.append({
+                        'type': etype, 'code': symbol, 'fundName': fund_name,
+                        'currency': currency, 'before': prev_amount, 'after': curr_amount,
+                        'effectiveAt': effective_at, 'observedAt': observed_at,
+                    })
+                elif prev_status != 'suspended' and curr_status == 'suspended':
+                    events.append({
+                        'type': 'suspend', 'code': symbol, 'fundName': fund_name,
+                        'currency': currency, 'before': prev_amount, 'after': None,
+                        'effectiveAt': effective_at, 'observedAt': observed_at,
+                    })
+                elif prev_status == 'suspended' and curr_status != 'suspended' and curr_amount is not None:
+                    events.append({
+                        'type': 'resume', 'code': symbol, 'fundName': fund_name,
+                        'currency': currency, 'before': 0, 'after': curr_amount,
+                        'effectiveAt': effective_at, 'observedAt': observed_at,
+                    })
+                elif prev_amount is None and curr_amount is not None and prev_status != 'suspended':
+                    events.append({
+                        'type': 'new_limit', 'code': symbol, 'fundName': fund_name,
+                        'currency': currency, 'before': 0, 'after': curr_amount,
+                        'effectiveAt': effective_at, 'observedAt': observed_at,
+                    })
+        # 过滤无金额事件（before/after 都为 None 对用户无意义）
+        events = [e for e in events if e.get('before') is not None or e.get('after') is not None]
+        # 去重：同一 code+type+before+after 只保留最新一条（多日快照 diff 会产生重复）
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for e in events:
+            key = '|'.join([str(e.get('code') or ''), str(e.get('type') or ''),
+                            str(e.get('before')), str(e.get('after'))])
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(e)
+        return unique[:50]
+
+    @staticmethod
+    def _finite_money(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            n = float(value)
+            return n if n > 0 and math.isfinite(n) else None
+        except (TypeError, ValueError):
+            return None
+
+
+
+    def _build_limit_trend_from_snapshots(self, days: int = 30) -> list[dict[str, Any]]:
+        # 用 fund_limit 历史快照重新计算每日总额，修正 ocr-proxy daily snapshot
+        # 里 suspended 残留金额导致的断崖（8-16->8-19 CNY 从 30110 暴跌到 110）。
+        # 只计 limit_large 且有金额的基金，suspended 的金额算 null 不计入总额。
+        if self.store is None:
+            return []
+        try:
+            history = self.store.read_fund_reference_history('fund_limit', days)
+        except Exception:
+            return []
+        if not history:
+            return []
+        by_date: dict[str, dict[str, float]] = {}
+        by_date_channel: dict[str, dict[str, dict[str, float]]] = {}
+        by_date_count: dict[str, int] = {}
+        for row in history:
+            date = str(row.get('snapshot_date') or '')
+            if not date:
+                continue
+            payload = row.get('payload') or {}
+            status = str(payload.get('buyStatus') or '').lower()
+            amount = None if status == 'suspended' else self._finite_money(payload.get('maxPurchasePerDay'))
+            currency = str(payload.get('currency') or 'CNY').upper()
+            if amount is not None and amount > 0 and status == 'limit_large':
+                totals = by_date.setdefault(date, {})
+                totals[currency] = totals.get(currency, 0.0) + amount
+                channel_limits = payload.get('channelLimits') or {}
+                direct = self._finite_money(channel_limits.get('direct') or channel_limits.get('all'))
+                distributor = self._finite_money(channel_limits.get('distributor') or channel_limits.get('all'))
+                if direct is not None or distributor is not None:
+                    channel_totals = by_date_channel.setdefault(date, {}).setdefault(currency, {})
+                    if direct is not None:
+                        channel_totals['direct'] = channel_totals.get('direct', 0.0) + direct
+                    if distributor is not None:
+                        channel_totals['distributor'] = channel_totals.get('distributor', 0.0) + distributor
+            by_date_count[date] = by_date_count.get(date, 0) + 1
+        trend = []
+        for date in sorted(by_date.keys()):
+            trend.append({
+                'date': date,
+                'totalByCurrency': by_date[date],
+                'channelTotals': by_date_channel.get(date, {}),
+                'coveredFundCount': by_date_count.get(date, 0),
+            })
+        return trend
+
     def _publish_limit_overview(self) -> int:
         """每日：从 ocr-proxy 拉场外限额聚合快照（含事件/趋势）写入 fund_limit_overview_snapshot。"""
         if self.fund_store is None:
@@ -469,6 +618,32 @@ class MarketCollector:
         except Exception as exc:
             print(f"[fund-store] fetch_fund_limit_overview failed: {exc}", flush=True)
             return 0
+        # collector 自己的 fund_limit 历史快照生成有金额变化的 events，
+        # 替换 ocr-proxy 的脏 events（scope_changed 噪音 + 缺失 tighten/relax）。
+        name_map = {}
+        for record in (payload.get('records') or []):
+            code = str(record.get('code') or '')
+            name = str(record.get('fundName') or record.get('name') or '')
+            if code and name:
+                name_map[code] = name
+        collector_events = self._build_limit_events_from_snapshots(30, name_map)
+        if collector_events:
+            payload['events'] = collector_events
+            payload['recentEvents'] = collector_events
+            print(f"[fund-store] replaced limit events: {len(collector_events)} from snapshots", flush=True)
+        # collector 历史快照重算 trend，修正 suspended 残留断崖
+        collector_trend = self._build_limit_trend_from_snapshots(30)
+        if collector_trend:
+            payload["trend"] = collector_trend
+            # 用 trend 最新一天的 totalByCurrency 同步 summary，让 currencyTotals 与 trend
+            # 口径一致（都是「所有 limit_large 基金单日限额之和」）。
+            # ocr-proxy 的 summary.totalByCurrency 来自 quotaGroups 去重聚合（只算 eligible
+            # 的 quotaGroup），与 trend 逐基金累加口径冲突，用户会看到「额度140 / 趋势790」矛盾。
+            latest_totals = collector_trend[-1].get('totalByCurrency') or {}
+            summary = payload.get('summary') or {}
+            summary['totalByCurrency'] = latest_totals
+            payload['summary'] = summary
+            print(f"[fund-store] replaced limit trend: {len(collector_trend)} days, totals={latest_totals}", flush=True)
         return self.fund_store.upsert_limit_overview(payload)
 
     def _fetch_nav_history_rows(self, codes: list[str]) -> list[dict[str, Any]]:
@@ -508,6 +683,47 @@ class MarketCollector:
                     out.append({"code": code, "date": str(row.get("date") or "")[:10], "nav": nav_f, "source": "holdings-nav-history"})
         return out
 
+    def _fetch_history_close_rows(self, symbol: str, limit: int = 3000) -> list[dict[str, Any]]:
+        """拉单只场内 ETF 真实日 K 收盘价（markets-worker 日 K，eastmoney 兜底）。"""
+        data_service = self._ensure_data_service()
+        payload = data_service.daily_price_klines(symbol, limit)
+        source = str(payload.get("source") or "eastmoney-kline")
+        out: list[dict[str, Any]] = []
+        for candle in (payload.get("candles") or []):
+            close = candle.get("c")
+            try:
+                close_f = float(close)
+            except (TypeError, ValueError):
+                continue
+            if not (close_f > 0):
+                continue
+            out.append({"code": symbol, "date": str(candle.get("date") or "")[:10], "close": close_f, "source": source})
+        return out
+
+    def _publish_history_close(self, limit: int = 120) -> int:
+        """写场内 ETF 真实日 K close 到 fund_history（净值同步不再覆盖）。
+
+        按标的逐只 upsert：全量合并成一个事务跨远端 TiDB 容易超时回滚（已实测），
+        逐只提交把事务控制在单标的历史量级，失败不影响其他标的。
+        日常增量只需近几个月（limit=120）；全量回填用 --history-close-once（limit=3000）。
+        """
+        if self.fund_store is None:
+            return 0
+        etf_symbols = list(self.config.get("symbols") or SYMBOLS)
+        total = 0
+        for symbol in etf_symbols:
+            try:
+                rows = self._fetch_history_close_rows(symbol, limit)
+            except Exception as exc:
+                print(f"[fund-store] daily_price_klines {symbol} fail: {exc}", flush=True)
+                continue
+            n = self.fund_store.upsert_history_close(rows)
+            if n == 0 and rows:
+                # 写失败重试一次（读超时/锁等待多为瞬时）
+                n = self.fund_store.upsert_history_close(rows)
+            total += n
+        return total
+
     def _publish_history_and_summary(self) -> tuple[int, int]:
         """每日：拉净值历史增量写 fund_history，再预算 fund_summary。"""
         if self.fund_store is None:
@@ -517,6 +733,12 @@ class MarketCollector:
         all_codes = list(dict.fromkeys(etf_symbols + otc_symbols))
         hist_rows = self._fetch_nav_history_rows(all_codes)
         hist_n = self.fund_store.upsert_history(hist_rows)
+        # 净值之后写真实市价 close：同日净值行已就位，close 只更新价格列
+        try:
+            cn = self._publish_history_close()
+            print(f"[fund-store] history close upsert={cn}", flush=True)
+        except Exception as exc:
+            print(f"[fund-store] history close failed: {exc}", flush=True)
         # 预算 summary
         import datetime as _dt
         RETURN_WINDOWS = [("return_1w", 7), ("return_1m", 31), ("return_3m", 93), ("return_6m", 186), ("return_1y", 365)]
@@ -612,7 +834,9 @@ class MarketCollector:
         with self._iopv_lock:
             for symbol in symbols:
                 row = iopv_map.get(symbol) or {}
-                if row.get("iopv") is not None:
+                # LOF 无盘中 IOPV，但东方财富会公布场内折溢价率（vendor_premium_percent）。
+                # 有 iopv 或 vendor_premium 都要缓存，高频线程才能算出 LOF 溢价。
+                if row.get("iopv") is not None or row.get("vendor_premium_percent") is not None:
                     self._iopv_cache[symbol] = row
         return len(iopv_map)
 
@@ -651,6 +875,7 @@ class MarketCollector:
                 "latestNav": None,
                 "latestNavDate": None,
                 "previousClose": pr.get("previous_close"),
+                "change": pr.get("change"),
                 "changePercent": pr.get("change_percent"),
                 "premiumPercent": premium_percent,
                 "iopv": iopv,
@@ -680,8 +905,8 @@ class MarketCollector:
         if not raw_targets:
             return 0
         target = raw_targets[0]
-        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,total_shares,market_capital,market_state,quote_date,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),total_shares=VALUES(total_shares),market_capital=VALUES(market_capital),market_state=VALUES(market_state),quote_date=VALUES(quote_date),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
+        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,market_state,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),market_state=VALUES(market_state),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
         import pymysql
         import os
         from .fund_store import _shanghai_iso, _num, _date_str
@@ -702,10 +927,7 @@ ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(
                 _num(r.get("iopv")),
                 _num(r.get("volume")),
                 _num(r.get("turnover")),
-                _num(r.get("totalShares")),
-                _num(r.get("marketCapital")),
                 str(r.get("marketState") or "").strip() or None,
-                _date_str(r.get("quoteDate")),
                 r.get("asOf") or r.get("collected_at"),
                 r.get("session"),
                 1 if r.get("suspended") else 0,

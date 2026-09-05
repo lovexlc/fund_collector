@@ -328,6 +328,7 @@ def resolve_request(
     body: dict[str, Any] | None = None,
     proxy_request: ProxyRequest = proxy_market_request,
     financials_request: FinancialsRequest = fetch_sec_financials,
+    offline: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     parsed = urlparse(path)
     route = _normalize_web_route(parsed.path.rstrip("/") or "/")
@@ -348,6 +349,7 @@ def resolve_request(
                 "/quotes?symbols=513100,QQQ", "/quote/{symbol}",
                 "/kline/{symbol}?tf=5m|1d&limit=500", "POST /fund-metrics",
                 "web compatibility proxy: indices, sectors, search, summary, news, earnings, financials, xueqiu-fund-data",
+                "offline mode (--offline) serves /quotes, /quote, /fund-metrics purely from local cache",
             ],
         }
 
@@ -421,6 +423,10 @@ def resolve_request(
     match = WEB_QUOTE_PATH.fullmatch(route)
     if match and data_service and method == "GET":
         local = _local_quote(data_service, match.group("symbol"))
+        if offline and local is not None:
+            return HTTPStatus.OK, local
+        if offline:
+            return HTTPStatus.NOT_FOUND, {"error": "symbol_not_found", "symbol": match.group("symbol")}
         upstream_status, upstream = proxy_request(
             method,
             route + (("?" + parsed.query) if parsed.query else ""),
@@ -444,6 +450,17 @@ def resolve_request(
             raw: quote for raw in requested
             if (quote := _local_quote(data_service, raw)) is not None
         }
+        if offline:
+            if local_quotes:
+                return HTTPStatus.OK, {
+                    "quotes": local_quotes,
+                    "generatedAt": max(
+                        (str(item.get("asOf") or "") for item in local_quotes.values()),
+                        default="",
+                    ),
+                    "source": "market-collector",
+                }
+            return HTTPStatus.NOT_FOUND, {"error": "symbols_not_found", "symbols": requested}
         upstream_status, upstream = proxy_request(
             method,
             route + "?" + urlencode({"symbols": ",".join(requested)}),
@@ -500,6 +517,20 @@ def resolve_request(
                 return data_service.fund_metrics(codes)
             except Exception:
                 return []
+
+        if offline:
+            items = [item for item in load_local_items() if isinstance(item, dict)]
+            if items:
+                return HTTPStatus.OK, {
+                    "items": items,
+                    "successCount": len(items),
+                    "failureCount": len(codes) - len(items),
+                    "generatedAt": max(
+                        (str(item.get("asOf") or item.get("updatedAt") or "") for item in items),
+                        default="",
+                    ),
+                }
+            return HTTPStatus.NOT_FOUND, {"error": "codes_not_found", "codes": codes}
 
         with ThreadPoolExecutor(max_workers=2) as executor:
             local_future = executor.submit(load_local_items)
@@ -593,7 +624,12 @@ def resolve_request(
     return HTTPStatus.NOT_FOUND, {"error": "route_not_found", "path": route}
 
 
-def build_handler(data_dir: Path, data_service: MarketDataService | None = None) -> type[BaseHTTPRequestHandler]:
+def build_handler(
+    data_dir: Path,
+    data_service: MarketDataService | None = None,
+    *,
+    offline: bool = False,
+) -> type[BaseHTTPRequestHandler]:
     class MarketCollectorHandler(BaseHTTPRequestHandler):
         server_version = "market-collector-api/1"
         sys_version = ""
@@ -644,6 +680,7 @@ def build_handler(data_dir: Path, data_service: MarketDataService | None = None)
                 data_service,
                 method=method,
                 body=body,
+                offline=offline,
             )
             self._send_payload(status, payload, include_body)
 
@@ -687,6 +724,12 @@ def parse_args() -> argparse.Namespace:
         default="/root/ai-dca/services/market-collector/data/market-collector.sqlite3",
     )
     parser.add_argument("--storage-backend", default="sqlite")
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        default=False,
+        help="Serve core market routes purely from the local collector cache without the upstream merge.",
+    )
     return parser.parse_args()
 
 
@@ -697,7 +740,10 @@ def main() -> int:
     store = build_store({"storage_backend": args.storage_backend, "database_path": args.database})
     store.initialize()
     data_service = MarketDataService(store, args.data_dir)
-    server = ThreadingHTTPServer((args.host, args.port), build_handler(Path(args.data_dir), data_service))
+    server = ThreadingHTTPServer(
+        (args.host, args.port),
+        build_handler(Path(args.data_dir), data_service, offline=args.offline),
+    )
     server.serve_forever()
     return 0
 

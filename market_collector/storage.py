@@ -183,6 +183,23 @@ class SQLiteStore:
                     PRIMARY KEY (symbol, bucket_start)
                 );
 
+                CREATE TABLE IF NOT EXISTS buckets_1m (
+                    symbol TEXT NOT NULL,
+                    bucket_start TEXT NOT NULL,
+                    session TEXT NOT NULL,
+                    sample_count INTEGER NOT NULL,
+                    first_sample_at TEXT NOT NULL,
+                    last_sample_at TEXT NOT NULL,
+                    price REAL,
+                    iopv REAL,
+                    computed_premium_percent REAL,
+                    vendor_premium_percent REAL,
+                    mismatch_pp REAL,
+                    quality_status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    PRIMARY KEY (symbol, bucket_start)
+                );
+
                 CREATE TABLE IF NOT EXISTS replica_outbox (
                     replica_id TEXT NOT NULL,
                     symbol TEXT NOT NULL,
@@ -269,77 +286,89 @@ class SQLiteStore:
                     continue
                 if record["session"] != "trading":
                     continue
-                bucket_start = bucket_start_iso(record["collected_at"])
-                existing = conn.execute(
-                    "SELECT * FROM buckets_5m WHERE symbol = ? AND bucket_start = ?",
-                    (record["symbol"], bucket_start),
-                ).fetchone()
-                if existing is None:
-                    conn.execute(
-                        """
-                        INSERT INTO buckets_5m (
-                            symbol, bucket_start, session, sample_count, first_sample_at, last_sample_at,
-                            price, iopv, computed_premium_percent, vendor_premium_percent, mismatch_pp,
-                            quality_status, payload_json
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            record["symbol"],
-                            bucket_start,
-                            record["session"],
-                            1,
-                            record["collected_at"],
-                            record["collected_at"],
-                            record.get("price"),
-                            record.get("iopv"),
-                            record.get("computed_premium_percent"),
-                            record.get("vendor_premium_percent"),
-                            record.get("mismatch_pp"),
-                            record["quality"]["status"],
-                            payload_json,
-                        ),
-                    )
-                    continue
-                sample_count = int(existing["sample_count"]) + 1
-                first_sample_at = min(str(existing["first_sample_at"]), record["collected_at"])
-                last_sample_at = max(str(existing["last_sample_at"]), record["collected_at"])
-                use_new = record["collected_at"] >= str(existing["last_sample_at"])
-                conn.execute(
-                    """
-                    UPDATE buckets_5m
-                    SET session = ?,
-                        sample_count = ?,
-                        first_sample_at = ?,
-                        last_sample_at = ?,
-                        price = ?,
-                        iopv = ?,
-                        computed_premium_percent = ?,
-                        vendor_premium_percent = ?,
-                        mismatch_pp = ?,
-                        quality_status = ?,
-                        payload_json = ?
-                    WHERE symbol = ? AND bucket_start = ?
-                    """,
-                    (
-                        record["session"] if use_new else existing["session"],
-                        sample_count,
-                        first_sample_at,
-                        last_sample_at,
-                        record.get("price") if use_new else existing["price"],
-                        record.get("iopv") if use_new else existing["iopv"],
-                        record.get("computed_premium_percent") if use_new else existing["computed_premium_percent"],
-                        record.get("vendor_premium_percent") if use_new else existing["vendor_premium_percent"],
-                        record.get("mismatch_pp") if use_new else existing["mismatch_pp"],
-                        record["quality"]["status"] if use_new else existing["quality_status"],
-                        payload_json if use_new else existing["payload_json"],
-                        record["symbol"],
-                        bucket_start,
-                    ),
-                )
+                for table, step_seconds in (("buckets_5m", 300), ("buckets_1m", 60)):
+                    self._upsert_bucket(conn, table, record, bucket_start_iso(record["collected_at"], step_seconds))
             cutoff_raw = isoformat_z(datetime.now(timezone.utc) - timedelta(hours=raw_retention_hours))
             cutoff_bucket = isoformat_z(datetime.now(timezone.utc) - timedelta(days=bucket_retention_days))
             conn.execute("DELETE FROM raw_samples WHERE collected_at < ?", (cutoff_raw,))
             conn.execute("DELETE FROM buckets_5m WHERE bucket_start < ?", (cutoff_bucket,))
+            conn.execute("DELETE FROM buckets_1m WHERE bucket_start < ?", (cutoff_bucket,))
+
+    def _upsert_bucket(
+        self,
+        conn: sqlite3.Connection,
+        table: str,
+        record: dict[str, Any],
+        bucket_start: str,
+    ) -> None:
+        """单样本 upsert 到分钟桶表（5m/1m 同逻辑，仅 bucket_start 粒度不同）。"""
+        payload_json = json.dumps(record, ensure_ascii=False, sort_keys=True)
+        existing = conn.execute(
+            f"SELECT * FROM {table} WHERE symbol = ? AND bucket_start = ?",
+            (record["symbol"], bucket_start),
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                f"""
+                INSERT INTO {table} (
+                    symbol, bucket_start, session, sample_count, first_sample_at, last_sample_at,
+                    price, iopv, computed_premium_percent, vendor_premium_percent, mismatch_pp,
+                    quality_status, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record["symbol"],
+                    bucket_start,
+                    record["session"],
+                    1,
+                    record["collected_at"],
+                    record["collected_at"],
+                    record.get("price"),
+                    record.get("iopv"),
+                    record.get("computed_premium_percent"),
+                    record.get("vendor_premium_percent"),
+                    record.get("mismatch_pp"),
+                    record["quality"]["status"],
+                    payload_json,
+                ),
+            )
+            return
+        sample_count = int(existing["sample_count"]) + 1
+        first_sample_at = min(str(existing["first_sample_at"]), record["collected_at"])
+        last_sample_at = max(str(existing["last_sample_at"]), record["collected_at"])
+        use_new = record["collected_at"] >= str(existing["last_sample_at"])
+        conn.execute(
+            f"""
+            UPDATE {table}
+            SET session = ?,
+                sample_count = ?,
+                first_sample_at = ?,
+                last_sample_at = ?,
+                price = ?,
+                iopv = ?,
+                computed_premium_percent = ?,
+                vendor_premium_percent = ?,
+                mismatch_pp = ?,
+                quality_status = ?,
+                payload_json = ?
+            WHERE symbol = ? AND bucket_start = ?
+            """,
+            (
+                record["session"] if use_new else existing["session"],
+                sample_count,
+                first_sample_at,
+                last_sample_at,
+                record.get("price") if use_new else existing["price"],
+                record.get("iopv") if use_new else existing["iopv"],
+                record.get("computed_premium_percent") if use_new else existing["computed_premium_percent"],
+                record.get("vendor_premium_percent") if use_new else existing["vendor_premium_percent"],
+                record.get("mismatch_pp") if use_new else existing["mismatch_pp"],
+                record["quality"]["status"] if use_new else existing["quality_status"],
+                payload_json if use_new else existing["payload_json"],
+                record["symbol"],
+                bucket_start,
+            ),
+        )
 
     def read_raw_samples(self, symbol: str, session: str = "trading") -> list[dict[str, Any]]:
         with closing(self.connect()) as conn:
@@ -849,6 +878,13 @@ class ShardedTiDBStore:
             f"{self.table_prefix}_buckets_5m_{slot:02d}",
         )
 
+    def _bucket_table_names(self, slot: int) -> list[tuple[str, int]]:
+        """分钟桶表 + 桶宽秒数；5m 供原有链路，1m 供首页溢价差/详情日 K 分时。"""
+        return [
+            (f"{self.table_prefix}_buckets_5m_{slot:02d}", 300),
+            (f"{self.table_prefix}_buckets_1m_{slot:02d}", 60),
+        ]
+
     def _reference_table_name(self, slot: int) -> str:
         return f"{self.table_prefix}_fund_reference_{slot:02d}"
 
@@ -910,7 +946,7 @@ class ShardedTiDBStore:
                 try:
                     with connection.cursor() as cursor:
                         for slot in target.slots:
-                            raw_table, bucket_table = self._table_names(slot)
+                            raw_table, _bucket_table = self._table_names(slot)
                             reference_table = self._reference_table_name(slot)
                             cursor.execute(f"""
                                 CREATE TABLE IF NOT EXISTS `{raw_table}` (
@@ -930,7 +966,7 @@ class ShardedTiDBStore:
                                     KEY idx_session_collected (session, collected_at)
                                 )
                             """)
-                            cursor.execute(f"""
+                            bucket_ddl = """
                                 CREATE TABLE IF NOT EXISTS `{bucket_table}` (
                                     symbol VARCHAR(32) NOT NULL,
                                     bucket_start VARCHAR(35) NOT NULL,
@@ -947,7 +983,9 @@ class ShardedTiDBStore:
                                     payload_json JSON NOT NULL,
                                     PRIMARY KEY (symbol, bucket_start)
                                 )
-                            """)
+                            """
+                            for bucket_table, _step in self._bucket_table_names(slot):
+                                cursor.execute(bucket_ddl.format(bucket_table=bucket_table))
                             cursor.execute(f"""
                                 CREATE TABLE IF NOT EXISTS `{reference_table}` (
                                     data_kind VARCHAR(32) NOT NULL,
@@ -993,7 +1031,7 @@ class ShardedTiDBStore:
         return existing
 
     def _write_slot(self, cursor: Any, slot: int, records: Sequence[dict[str, Any]]) -> None:
-        raw_table, bucket_table = self._table_names(slot)
+        raw_table, _bucket_table = self._table_names(slot)
         unique_records: dict[tuple[str, str], dict[str, Any]] = {}
         for record in records:
             key = (str(record["symbol"]), canonical_timestamp(str(record["collected_at"])))
@@ -1032,32 +1070,38 @@ class ShardedTiDBStore:
             """,
             raw_rows,
         )
-        grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
-        for record in new_records:
-            if record.get("session") != "trading":
+        def build_bucket_rows(step_seconds: int) -> list[tuple]:
+            grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+            for record in new_records:
+                if record.get("session") != "trading":
+                    continue
+                collected_at = canonical_timestamp(str(record["collected_at"]))
+                grouped[(str(record["symbol"]), bucket_start_iso(collected_at, step_seconds))].append(record)
+            bucket_rows = []
+            for (symbol, bucket_start), samples in grouped.items():
+                ordered = sorted(samples, key=lambda item: parse_iso(str(item["collected_at"])))
+                latest = ordered[-1]
+                bucket_rows.append((
+                    symbol,
+                    bucket_start,
+                    str(latest["session"]),
+                    len(ordered),
+                    canonical_timestamp(str(ordered[0]["collected_at"])),
+                    canonical_timestamp(str(latest["collected_at"])),
+                    latest.get("price"),
+                    latest.get("iopv"),
+                    latest.get("computed_premium_percent"),
+                    latest.get("vendor_premium_percent"),
+                    latest.get("mismatch_pp"),
+                    str((latest.get("quality") or {}).get("status") or "missing"),
+                    json.dumps(latest, ensure_ascii=False, sort_keys=True),
+                ))
+            return bucket_rows
+
+        for bucket_table, step_seconds in self._bucket_table_names(slot):
+            bucket_rows = build_bucket_rows(step_seconds)
+            if not bucket_rows:
                 continue
-            collected_at = canonical_timestamp(str(record["collected_at"]))
-            grouped[(str(record["symbol"]), bucket_start_iso(collected_at))].append(record)
-        bucket_rows = []
-        for (symbol, bucket_start), samples in grouped.items():
-            ordered = sorted(samples, key=lambda item: parse_iso(str(item["collected_at"])))
-            latest = ordered[-1]
-            bucket_rows.append((
-                symbol,
-                bucket_start,
-                str(latest["session"]),
-                len(ordered),
-                canonical_timestamp(str(ordered[0]["collected_at"])),
-                canonical_timestamp(str(latest["collected_at"])),
-                latest.get("price"),
-                latest.get("iopv"),
-                latest.get("computed_premium_percent"),
-                latest.get("vendor_premium_percent"),
-                latest.get("mismatch_pp"),
-                str((latest.get("quality") or {}).get("status") or "missing"),
-                json.dumps(latest, ensure_ascii=False, sort_keys=True),
-            ))
-        if bucket_rows:
             cursor.executemany(
                 f"""
                 INSERT INTO `{bucket_table}` (
@@ -1125,15 +1169,16 @@ class ShardedTiDBStore:
                                 datetime.now(timezone.utc) - timedelta(days=bucket_retention_days)
                             )
                             for slot in target.slots:
-                                raw_table, bucket_table = self._table_names(slot)
+                                raw_table, _bucket_table = self._table_names(slot)
                                 cursor.execute(
                                     f"DELETE FROM `{raw_table}` WHERE collected_at < %s",
                                     (cutoff_raw,),
                                 )
-                                cursor.execute(
-                                    f"DELETE FROM `{bucket_table}` WHERE bucket_start < %s",
-                                    (cutoff_bucket,),
-                                )
+                                for bucket_table, _step in self._bucket_table_names(slot):
+                                    cursor.execute(
+                                        f"DELETE FROM `{bucket_table}` WHERE bucket_start < %s",
+                                        (cutoff_bucket,),
+                                    )
                     connection.commit()
                 except Exception:
                     try:

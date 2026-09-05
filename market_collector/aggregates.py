@@ -178,6 +178,10 @@ class MarketDataService:
             "asOf": item.get("price_timestamp") or item.get("collected_at"),
             "quoteDate": str(item.get("collected_at") or "")[:10],
             "quality": item.get("quality"),
+            "iopv": item.get("iopv"),
+            "iopvDate": str(item.get("iopv_timestamp") or item.get("navDate") or "")[:10],
+            "premiumPercent": item.get("computed_premium_percent", item.get("premiumPercent")),
+            "vendorPremiumPercent": item.get("vendor_premium_percent"),
         }
 
     def fund_metric(self, symbol: str) -> dict[str, Any] | None:
@@ -202,6 +206,7 @@ class MarketDataService:
             "volume": item.get("volume"),
             "turnover": item.get("turnover"),
             "turnoverRate": item.get("turnover_rate"),
+            "suspended": bool(item.get("suspended")),
             "marketState": "OPEN" if item.get("session") == "trading" else "CLOSED",
             "asOf": item.get("collected_at"),
             "expiresAt": item.get("expires_at"),

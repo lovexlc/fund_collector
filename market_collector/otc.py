@@ -22,7 +22,7 @@ OTC_SYMBOLS = [
     "019441", "019442", "019736", "019737", "019738", "019739", "016452", "016453",
     "021000", "018043", "018044", "022525", "539001", "012751", "012752", "012753",
     "023422", "021773", "022664", "024237", "017641", "019305", "017642", "017643",
-    "017028", "017030", "018064", "018065", "018066", "050025", "006075", "018738",
+    "017028", "017030", "018064", "018065", "018066", "050025", "050030", "006075", "018738",
     "013425", "013499", "007721", "007722", "022523", "161125", "012860", "003718",
     "012861",
 ]
@@ -52,9 +52,11 @@ def _to_shanghai(value: Any) -> Any:
 
 
 def _fetch_batch(codes: list[str], timeout_sec: float, client: PostJson) -> dict[str, Any]:
+    # 不传 fundKinds：fund-metrics 接口内部从 danjuan type_desc 自动判定 QDII/OTC。
+    # 之前硬编码 {code: "qdii" for code in codes} 在 OTC_SYMBOLS 全是 QDII 时正确，
+    # 但加入纯 A 股场外基金时会错标 qdii（T-1），导致净值日期口径错误。
     return client(FUND_METRICS_URL, {
         "codes": codes,
-        "fundKinds": {code: "qdii" for code in codes},
     }, timeout_sec)
 
 

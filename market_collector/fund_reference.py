@@ -13,6 +13,44 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 DEFAULT_WORKER_URL = "https://api.freebacktrack.tech"
 FEE_BATCH_SIZE = 24
 
+LIMIT_SCHEMA_VERSION = 2
+
+
+def _positive_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number == number and number not in (float("inf"), float("-inf")) and number > 0 else None
+
+
+def normalize_limit_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """把 Worker 的双渠道限额规范化为 collector 的正式 payload。"""
+    data = dict(payload or {})
+    raw_limits = data.get("channelLimits")
+    limits: dict[str, float] = {}
+    if isinstance(raw_limits, dict):
+        for key in ("direct", "distributor", "all"):
+            value = _positive_number(raw_limits.get(key))
+            if value is not None:
+                limits[key] = value
+    if not limits:
+        amount = _positive_number(data.get("maxPurchasePerDay"))
+        if amount is not None:
+            limits["all"] = amount
+    if limits:
+        data["channelLimits"] = limits
+        primary = limits.get("direct") or limits.get("all") or limits.get("distributor")
+        if primary is not None:
+            data["maxPurchasePerDay"] = primary
+        if limits.get("direct") is not None:
+            data["limitChannel"] = "app"
+        elif limits.get("distributor") is not None:
+            data["limitChannel"] = "channel"
+    data["limitSchemaVersion"] = LIMIT_SCHEMA_VERSION
+    return data
+
+
 JsonRequest = Callable[[str, str, dict[str, Any] | None, float], dict[str, Any]]
 
 
@@ -121,7 +159,7 @@ def _fetch_one_limit(
     response_code = normalize_fund_code(payload.get("code") or code)
     if response_code != code:
         return code, None, "response code mismatch"
-    return code, payload, None
+    return code, normalize_limit_payload(payload), None
 
 
 def _fetch_limit_records(
@@ -194,3 +232,13 @@ def fetch_fund_references(
         "records": records,
         "errors": fee_errors + limit_errors,
     }
+
+
+def fetch_fund_limit_overview(
+    worker_url: str = DEFAULT_WORKER_URL,
+    timeout_sec: float = 25.0,
+    client: JsonRequest = request_json,
+) -> dict[str, Any]:
+    """拉取场外限额聚合快照（ocr-proxy /api/fund-limit/overview，含 quotaGroups/events/trend）。"""
+    endpoint = worker_url.rstrip("/") + "/api/fund-limit/overview?days=30"
+    return client("GET", endpoint, None, timeout_sec)

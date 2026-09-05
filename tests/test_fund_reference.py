@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from market_collector.core import DEFAULT_CONFIG, MarketCollector, deep_update, due_daily_slot
-from market_collector.fund_reference import FEE_BATCH_SIZE, fetch_fund_references
+from market_collector.fund_reference import FEE_BATCH_SIZE, fetch_fund_references, normalize_limit_payload
 
 
 class FakeStore:
@@ -24,6 +24,17 @@ class FakeStore:
 
 
 class FundReferenceTest(unittest.TestCase):
+    def test_normalizes_direct_and_distributor_limits(self) -> None:
+        payload = normalize_limit_payload({
+            "code": "040046",
+            "maxPurchasePerDay": 10,
+            "channelLimits": {"direct": 100, "distributor": 10},
+        })
+        self.assertEqual(payload["channelLimits"], {"direct": 100.0, "distributor": 10.0})
+        self.assertEqual(payload["maxPurchasePerDay"], 100.0)
+        self.assertEqual(payload["limitChannel"], "app")
+        self.assertEqual(payload["limitSchemaVersion"], 2)
+
     def test_fetches_fee_batches_and_cache_only_limits(self) -> None:
         codes = [f"{index:06d}" for index in range(FEE_BATCH_SIZE + 1)]
         calls: list[tuple[str, str, dict | None]] = []

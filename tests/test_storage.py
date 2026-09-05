@@ -82,6 +82,38 @@ class StorageTest(unittest.TestCase):
             self.assertEqual(row[1], "2026-08-11T10:04:59+08:00")
             self.assertEqual(row[2], 2.2)
 
+    def test_buckets_1m_written_alongside_5m(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = str(Path(temp_dir) / "collector.sqlite3")
+            store = SQLiteStore(path)
+            store.initialize()
+            store.write_cycle(
+                [
+                    sample("513100", "2026-08-11T10:01:10+08:00", 2.10),
+                    sample("513100", "2026-08-11T10:01:50+08:00", 2.15),
+                    sample("513100", "2026-08-11T10:02:30+08:00", 2.20),
+                ],
+                raw_retention_hours=48,
+                bucket_retention_days=14,
+            )
+            conn = sqlite3.connect(path)
+            rows_1m = conn.execute(
+                "SELECT bucket_start, sample_count, price FROM buckets_1m ORDER BY bucket_start",
+            ).fetchall()
+            rows_5m = conn.execute(
+                "SELECT count(*) FROM buckets_5m",
+            ).fetchone()[0]
+            conn.close()
+
+            self.assertEqual(len(rows_1m), 2)
+            self.assertEqual(rows_1m[0][0], "2026-08-11T10:01:00+08:00")
+            self.assertEqual(rows_1m[0][1], 2)
+            self.assertEqual(rows_1m[0][2], 2.15)
+            self.assertEqual(rows_1m[1][0], "2026-08-11T10:02:00+08:00")
+            self.assertEqual(rows_1m[1][1], 1)
+            self.assertEqual(rows_1m[1][2], 2.2)
+            self.assertEqual(rows_5m, 1)
+
     def test_lunch_session_does_not_create_bucket(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = str(Path(temp_dir) / "collector.sqlite3")

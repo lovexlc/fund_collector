@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 TENCENT_QUOTE_URL = "https://qt.gtimg.cn/"
 EASTMONEY_LIST_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
+EASTMONEY_ULIST_URL = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
 EASTMONEY_PUSH_TOKEN = "bd1d9ddb04089700cf9c27f6f7426281"
 EASTMONEY_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
 EASTMONEY_FIELDS = "f12,f14,f2,f3,f124,f402,f441"
@@ -60,6 +61,13 @@ def tencent_symbol(symbol: str) -> str:
     return prefix + code
 
 
+def eastmoney_secid(symbol: str) -> str:
+    # 东方财富 secid：沪市（5/6 开头）= 1.code，深市（0/1/3 开头，含 LOF）= 0.code
+    code = normalize_symbol(symbol)
+    market = "1" if code.startswith(("5", "6")) else "0"
+    return f"{market}.{code}"
+
+
 def default_fetch_bytes(url: str, timeout_sec: float) -> bytes:
     request = urllib.request.Request(
         url,
@@ -101,6 +109,8 @@ def parse_tencent_quote_text(text: str, captured_at: str) -> dict[str, dict[str,
             turnover_fallback = to_float(fields[37])
             turnover = turnover_fallback * 10000 if turnover_fallback is not None else None
         turnover_rate = to_float(fields[38]) if len(fields) > 38 else None
+        # field[40] 状态位："S"=停牌(Suspend)，空=正常交易
+        status_flag = str(fields[40]).strip() if len(fields) > 40 else ""
         rows[code] = {
             "symbol": code,
             "name": fields[1] or code,
@@ -114,6 +124,7 @@ def parse_tencent_quote_text(text: str, captured_at: str) -> dict[str, dict[str,
             "volume": volume,
             "turnover": turnover,
             "turnover_rate": round4(turnover_rate),
+            "suspended": status_flag == "S",
             "source": "tencent_batch",
             "received_at": captured_at,
             "source_as_of": normalize_source_as_of(fields[30] if len(fields) > 30 else None, captured_at),
@@ -212,4 +223,28 @@ def fetch_eastmoney_references(
         if not page_rows:
             break
         page += 1
+    # clist 按板块翻页可能漏掉不在基金板块里的标的（如深市 LOF 161128/161130），
+    # 用 ulist.np 按 secid 列表补查，f402（基金公司公布的场内折溢价率）对 LOF 有值。
+    if wanted:
+        secids = [eastmoney_secid(symbol) for symbol in wanted if normalize_symbol(symbol)]
+        ulist_missing = [normalize_symbol(symbol) for symbol in wanted if normalize_symbol(symbol)]
+        for start in range(0, len(secids), 100):
+            batch = secids[start:start + 100]
+            params = urllib.parse.urlencode({
+                "secids": ",".join(batch),
+                "fields": EASTMONEY_FIELDS,
+                "fltt": 2,
+                "invt": 2,
+            })
+            captured_at = isoformat_z(utc_now())
+            try:
+                payload = json.loads(fetch_bytes(EASTMONEY_ULIST_URL + "?" + params, timeout_sec).decode("utf-8", "replace"))
+            except Exception:
+                continue
+            page_rows = parse_eastmoney_list_payload(payload, captured_at, 0)
+            for symbol in list(ulist_missing):
+                row = page_rows.get(symbol)
+                if row:
+                    found[symbol] = row
+                    wanted.discard(symbol)
     return found, {"page_size": page_size, "pages_visited": page, "missing_symbols": sorted(wanted)}

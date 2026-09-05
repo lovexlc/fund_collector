@@ -16,6 +16,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Fetch and store one fee/limit snapshot, then exit.",
     )
+    parser.add_argument(
+        "--history-close-once",
+        action="store_true",
+        help="Backfill real daily close prices into fund_history, then exit.",
+    )
     return parser.parse_args(argv)
 
 
@@ -25,6 +30,10 @@ def main(argv: list[str] | None = None) -> int:
     collector = MarketCollector(config)
     if args.fund_reference_once:
         collector.collect_fund_references_once()
+        return 0
+    if args.history_close_once:
+        n = collector._publish_history_close(limit=3000)
+        print(f"[history-close] upserted {n} rows", flush=True)
         return 0
     if args.once:
         collector.collect_once()
