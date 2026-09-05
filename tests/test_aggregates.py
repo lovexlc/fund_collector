@@ -3,11 +3,22 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from market_collector.aggregates import MarketDataService
 from market_collector.http_server import resolve_request
 from market_collector.storage import SQLiteStore
+
+
+# 写死的历史日期会被 write_cycle 的 retention 清理（168h/14d 窗口），
+# 改用「昨天」的固定时刻生成时间戳，保证样本永远可读。
+RECENT_DAY = (datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=1)).date().isoformat()
+
+
+def recent(hhmmss: str) -> str:
+    return f"{RECENT_DAY}T{hhmmss}+08:00"
 
 
 def record(collected_at: str, price: float, iopv: float, premium: float) -> dict:
@@ -49,13 +60,13 @@ class AggregateServiceTest(unittest.TestCase):
         self.store = SQLiteStore(str(self.database))
         self.store.initialize()
         self.store.write_cycle([
-            record("2026-08-11T09:30:05+08:00", 2.10, 2.00, 5.0),
-            record("2026-08-11T09:34:50+08:00", 2.14, 2.01, 6.4677),
-            record("2026-08-11T09:35:10+08:00", 2.12, 2.02, 4.9505),
+            record(recent("09:30:05"), 2.10, 2.00, 5.0),
+            record(recent("09:34:50"), 2.14, 2.01, 6.4677),
+            record(recent("09:35:10"), 2.12, 2.02, 4.9505),
         ], 168, 14)
         (self.data_dir / "latest.json").write_text(json.dumps({
-            "generated_at": "2026-08-11T09:35:10+08:00",
-            "symbols": [record("2026-08-11T09:35:10+08:00", 2.12, 2.02, 4.9505)],
+            "generated_at": recent("09:35:10"),
+            "symbols": [record(recent("09:35:10"), 2.12, 2.02, 4.9505)],
         }), encoding="utf-8")
         (self.data_dir / "otc-latest.json").write_text(json.dumps({
             "generated_at": "2026-08-11T19:30:00+08:00",

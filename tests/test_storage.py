@@ -4,7 +4,9 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from datetime import datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from market_collector.storage import (
     DualWriteStore,
@@ -15,6 +17,15 @@ from market_collector.storage import (
     build_store,
     logical_shard_for_symbol,
 )
+
+
+# 写死的历史日期会被 write_cycle 的 raw/bucket retention 清理（如 2026-08-11 已超 168h/14d 窗口），
+# 改用「昨天」的固定时刻生成时间戳，保证永远落在 retention 窗口内，测试不再随时间腐烂。
+RECENT_DAY = (datetime.now(ZoneInfo("Asia/Shanghai")) - timedelta(days=1)).date().isoformat()
+
+
+def recent(hhmmss: str) -> str:
+    return f"{RECENT_DAY}T{hhmmss}+08:00"
 
 
 def sample(symbol: str, collected_at: str, price: float) -> dict:
@@ -65,8 +76,8 @@ class StorageTest(unittest.TestCase):
             store.initialize()
             store.write_cycle(
                 [
-                    sample("513100", "2026-08-11T10:01:00+08:00", 2.10),
-                    sample("513100", "2026-08-11T10:04:59+08:00", 2.20),
+                    sample("513100", recent("10:01:00"), 2.10),
+                    sample("513100", recent("10:04:59"), 2.20),
                 ],
                 raw_retention_hours=48,
                 bucket_retention_days=14,
@@ -74,12 +85,12 @@ class StorageTest(unittest.TestCase):
             conn = sqlite3.connect(path)
             row = conn.execute(
                 "SELECT sample_count, last_sample_at, price FROM buckets_5m WHERE symbol = ? AND bucket_start = ?",
-                ("513100", "2026-08-11T10:00:00+08:00"),
+                ("513100", recent("10:00:00")),
             ).fetchone()
             conn.close()
 
             self.assertEqual(row[0], 2)
-            self.assertEqual(row[1], "2026-08-11T10:04:59+08:00")
+            self.assertEqual(row[1], recent("10:04:59"))
             self.assertEqual(row[2], 2.2)
 
     def test_buckets_1m_written_alongside_5m(self) -> None:
@@ -89,9 +100,9 @@ class StorageTest(unittest.TestCase):
             store.initialize()
             store.write_cycle(
                 [
-                    sample("513100", "2026-08-11T10:01:10+08:00", 2.10),
-                    sample("513100", "2026-08-11T10:01:50+08:00", 2.15),
-                    sample("513100", "2026-08-11T10:02:30+08:00", 2.20),
+                    sample("513100", recent("10:01:10"), 2.10),
+                    sample("513100", recent("10:01:50"), 2.15),
+                    sample("513100", recent("10:02:30"), 2.20),
                 ],
                 raw_retention_hours=48,
                 bucket_retention_days=14,
@@ -106,10 +117,10 @@ class StorageTest(unittest.TestCase):
             conn.close()
 
             self.assertEqual(len(rows_1m), 2)
-            self.assertEqual(rows_1m[0][0], "2026-08-11T10:01:00+08:00")
+            self.assertEqual(rows_1m[0][0], recent("10:01:00"))
             self.assertEqual(rows_1m[0][1], 2)
             self.assertEqual(rows_1m[0][2], 2.15)
-            self.assertEqual(rows_1m[1][0], "2026-08-11T10:02:00+08:00")
+            self.assertEqual(rows_1m[1][0], recent("10:02:00"))
             self.assertEqual(rows_1m[1][1], 1)
             self.assertEqual(rows_1m[1][2], 2.2)
             self.assertEqual(rows_5m, 1)
@@ -133,7 +144,7 @@ class StorageTest(unittest.TestCase):
             path = str(Path(temp_dir) / "collector.sqlite3")
             store = SQLiteStore(path)
             store.initialize()
-            item = sample("513100", "2026-08-11T10:01:00+08:00", 2.10)
+            item = sample("513100", recent("10:01:00"), 2.10)
             store.write_cycle([item], raw_retention_hours=168, bucket_retention_days=14)
             store.write_cycle([item], raw_retention_hours=168, bucket_retention_days=14)
             conn = sqlite3.connect(path)
@@ -148,8 +159,8 @@ class StorageTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = SQLiteStore(str(Path(temp_dir) / "collector.sqlite3"))
             store.initialize()
-            trading = sample("513100", "2026-08-11T10:01:00+08:00", 2.10)
-            lunch = sample("513100", "2026-08-11T11:31:00+08:00", 2.20)
+            trading = sample("513100", recent("10:01:00"), 2.10)
+            lunch = sample("513100", recent("11:31:00"), 2.20)
             lunch["session"] = "lunch"
             store.write_cycle([lunch, trading], raw_retention_hours=168, bucket_retention_days=14)
 
@@ -282,8 +293,8 @@ class StorageTest(unittest.TestCase):
             replica = FakeReplica()
             store = DualWriteStore(primary, [replica], outbox_batch_size=20)
             store.initialize()
-            first = sample("513100", "2026-08-11T10:01:00+08:00", 2.10)
-            second = sample("513100", "2026-08-11T10:02:00+08:00", 2.11)
+            first = sample("513100", recent("10:01:00"), 2.10)
+            second = sample("513100", recent("10:02:00"), 2.11)
 
             store.write_cycle([first], 168, 14)
 
