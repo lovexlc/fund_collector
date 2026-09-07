@@ -345,6 +345,7 @@ def resolve_request(
                 "/fund-metrics?codes=513100,513500",
                 "/otc/latest",
                 "/aggregates/home-market-overview", "/aggregates/home-market-series",
+                "/aggregates/fund-limit-overview", "/aggregates/home-market-collect",
                 "/datasets/{dataset}/{key}",
                 "/quotes?symbols=513100,QQQ", "/quote/{symbol}",
                 "/kline/{symbol}?tf=5m|1d&limit=500", "POST /fund-metrics",
@@ -591,6 +592,28 @@ def resolve_request(
 
     if route == "/aggregates/home-market-series" and data_service:
         return HTTPStatus.OK, data_service.home_series()
+
+    if route == "/aggregates/fund-limit-overview" and data_service:
+        return HTTPStatus.OK, data_service.fund_limit_overview()
+
+    if route == "/aggregates/home-market-collect" and data_service:
+        # On-demand refresh is deliberately collector-local: no CF Worker proxy.
+        try:
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                overview = executor.submit(data_service.home_overview)
+                series = executor.submit(data_service.home_series)
+                limits = executor.submit(data_service.fund_limit_overview)
+                return HTTPStatus.OK, {
+                    "overview": overview.result(),
+                    "series": series.result(),
+                    "limits": limits.result(),
+                    "generatedAt": datetime.now(timezone.utc).isoformat(),
+                    "source": "market-collector-local",
+                }
+        except Exception as exc:
+            return HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "local_home_collect_failed", "detail": str(exc),
+            }
 
     match = DATASET_PATH.fullmatch(route)
     if match and data_service:

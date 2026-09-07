@@ -195,6 +195,28 @@ class ProductSnapshotService(MarketDataService):
             self.product_store.read_products,
         )
 
+    def _latest_by_symbol(self) -> dict[str, dict[str, Any]]:
+        try:
+            fallback = super()._latest_by_symbol()
+        except (FileNotFoundError, OSError, ValueError):
+            fallback = {}
+        return {**fallback, **self._product_map()}
+
+    def _latest(self) -> dict[str, Any]:
+        products = self._product_map()
+        if not products:
+            return super()._latest()
+        generated = max((str(row.get("asOf") or row.get("updatedAt") or "") for row in products.values()), default="")
+        symbols = [{
+            **row,
+            "computed_premium_percent": row.get("premiumPercent"),
+            "change_percent": row.get("changePercent"),
+            "previous_close": row.get("previousClose"),
+            "collected_at": row.get("asOf") or row.get("updatedAt"),
+            "iopv_timestamp": row.get("latestNavDate"),
+        } for row in products.values()]
+        return {"generated_at": generated, "symbols": symbols, "source": "fund-products"}
+
     def quote(self, symbol: str) -> dict[str, Any] | None:
         product = self._product_map().get(symbol)
         try:
