@@ -96,13 +96,13 @@ def _market_state() -> tuple[str, str]:
     session = classify_session(datetime.now(timezone.utc))
     current = datetime.now(SHANGHAI)
     if current.weekday() >= 5:
-        return "holiday", "非交易日"
+        return "holiday", "A 股休市"
     if session == "trading":
         return "open", "A 股连续竞价"
     if session == "lunch":
         return "lunch_break", "A 股午间休市"
     if current.time() < datetime.strptime("09:30", "%H:%M").time():
-        return "pre_open", "A 股盘前"
+        return "pre_open", "A 股待开市"
     return "closed", "A 股已收市"
 
 
@@ -579,89 +579,121 @@ class MarketDataService:
         return self.cache.get_or_load(cache_key, 60, lambda: fetch_market_summary(normalized, self.timeout_sec))
 
     def fund_limit_overview(self) -> dict[str, Any]:
-        import statistics as _stats
-
+        """Build a Mini Program compatible OTC quota snapshot from local history."""
         rows = self.store.read_fund_reference_history("fund_limit", 30)
+        empty = {
+            "schemaVersion": 1, "limitAsOf": None, "generatedAt": None,
+            "coverage": {"covered": 0, "total": 0, "review": 0},
+            "currencyTotals": [], "records": [], "trend": [], "events": [],
+            "source": "market-collector",
+        }
         if not rows:
-            return {
-                "schemaVersion": 1,
-                "limitAsOf": None,
-                "coverage": {"covered": 0, "total": 0, "review": 0},
-                "currencyTotals": [],
-                "trend": [],
-                "events": [],
-                "source": "market-collector",
-            }
+            return empty
+
+        def status_of(payload: dict[str, Any]) -> str:
+            raw = str(payload.get("purchaseStatus") or payload.get("buyStatus") or payload.get("status") or "").strip().lower()
+            if raw in {"suspend", "suspended", "paused", "closed"}:
+                return "suspended"
+            if raw in {"limit_large", "limited", "restricted", "limit"}:
+                return "limited"
+            if raw in {"open", "available", "normal"}:
+                return "open"
+            return "unknown"
+
+        def amount_of(payload: dict[str, Any]) -> float | None:
+            for key in ("limitAmount", "maxPurchasePerDay", "amount", "purchaseLimit"):
+                value = _number(payload.get(key))
+                if value is not None and value >= 0:
+                    return value
+            return None
+
+        def currency_of(payload: dict[str, Any]) -> str:
+            value = str(payload.get("currency") or "CNY").strip().upper()
+            return value if value in {"CNY", "USD"} else "CNY"
+
+        def name_of(code: str, payload: dict[str, Any]) -> str:
+            if code == "022523":
+                return "天弘标普500发起(QDII-FOF)D"
+            return str(payload.get("fundName") or payload.get("name") or code)
+
         by_symbol: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            by_symbol.setdefault(str(row["symbol"]), []).append(row)
-        # 排序每个 symbol 的快照
-        for sym in by_symbol:
-            by_symbol[sym].sort(key=lambda r: str(r["snapshot_date"]))
-        latest_date = max(str(r["snapshot_date"]) for r in rows)
-        latest_rows = [r for r in rows if str(r["snapshot_date"]) == latest_date]
-        total_funds = len(by_symbol)
+            code = str(row.get("symbol") or "")
+            if code:
+                by_symbol.setdefault(code, []).append(row)
+        for snapshots in by_symbol.values():
+            snapshots.sort(key=lambda item: (str(item.get("snapshot_date") or ""), str(item.get("fetched_at") or "")))
 
-        def is_limited(p: dict[str, Any]) -> bool:
-            s = str(p.get("buyStatus") or "").strip()
-            return bool(s) and s != "open"
+        latest_rows = [snapshots[-1] for snapshots in by_symbol.values() if snapshots]
+        latest_date = max(str(row.get("snapshot_date") or "") for row in latest_rows)
+        generated_at = max((str(row.get("fetched_at") or "") for row in latest_rows), default="") or latest_date
+        records = []
+        for row in latest_rows:
+            payload = row.get("payload") or {}
+            code = str(row.get("symbol") or payload.get("code") or "")
+            status = status_of(payload)
+            amount = None if status == "suspended" else amount_of(payload)
+            channel = str(payload.get("limitChannel") or "").lower()
+            app_label = str(payload.get("limitChannelText") or "")
+            if not app_label:
+                app_label = "基金公司 App" if channel == "app" else ("销售渠道" if channel == "channel" else "")
+            records.append({
+                "code": code, "fundName": name_of(code, payload), "name": name_of(code, payload),
+                "currency": currency_of(payload), "purchaseStatus": status,
+                "buyStatus": str(payload.get("buyStatus") or ""), "limitAmount": _round4(amount),
+                "amount": _round4(amount), "isSuspended": status == "suspended",
+                "isPending": bool(payload.get("isPending")) or status == "unknown", "appLabel": app_label,
+                "channelLimits": payload.get("channelLimits") or {},
+            })
+        records.sort(key=lambda item: (item["currency"], item["isSuspended"], -(item["amount"] or 0), item["name"]))
 
-        def amount(p: dict[str, Any]) -> float | None:
-            v = _number(p.get("maxPurchasePerDay"))
-            return v if v is not None else None
+        currencies = sorted({item["currency"] for item in records}, key=lambda value: (value != "CNY", value))
+        currency_totals = []
+        for currency in currencies:
+            current = [item for item in records if item["currency"] == currency]
+            eligible = [item for item in current if not item["isPending"] and item["purchaseStatus"] != "unknown"]
+            limited = [item for item in eligible if item["purchaseStatus"] == "limited"]
+            currency_totals.append({"currency": currency, "amount": _round4(sum(item["amount"] or 0 for item in limited)), "fundCount": len(eligible), "limitedCount": len(limited)})
 
-        limited_latest = [r for r in latest_rows if is_limited(r["payload"])]
-        review_count = sum(1 for r in latest_rows if str(r["payload"].get("buyStatus") or "") in ("limit_large", "suspend"))
-        cny_amount = sum(amount(r["payload"]) or 0 for r in limited_latest)
-
-        # 趋势
         by_date: dict[str, list[dict[str, Any]]] = {}
-        for r in rows:
-            by_date.setdefault(str(r["snapshot_date"]), []).append(r)
+        for row in rows:
+            by_date.setdefault(str(row.get("snapshot_date") or ""), []).append(row)
         trend = []
-        for date_str in sorted(by_date):
-            day = by_date[date_str]
-            limited = [d for d in day if is_limited(d["payload"])]
-            cny = sum(amount(d["payload"]) or 0 for d in limited)
-            trend.append({"date": date_str, "cny": _round4(cny), "usd": None, "coveredCount": len(day)})
+        for day in sorted(key for key in by_date if key):
+            totals: dict[str, float] = {}
+            for row in by_date[day]:
+                payload = row.get("payload") or {}
+                if status_of(payload) != "limited" or bool(payload.get("isPending")):
+                    continue
+                value = amount_of(payload)
+                if value is not None:
+                    currency = currency_of(payload)
+                    totals[currency] = totals.get(currency, 0.0) + value
+            trend.append({"date": day, "cny": _round4(totals.get("CNY")), "usd": _round4(totals.get("USD")), "totalByCurrency": {key: _round4(value) for key, value in totals.items()}, "coveredCount": len(by_date[day])})
 
-        # 事件：相邻快照 buyStatus / maxPurchasePerDay 变化
         events = []
-        review_statuses = {"limit_large", "suspend"}
-        for sym, snapshots in by_symbol.items():
-            for i in range(1, len(snapshots)):
-                before = snapshots[i - 1]["payload"]
-                after = snapshots[i]["payload"]
-                before_amt = amount(before)
-                after_amt = amount(after)
-                before_status = str(before.get("buyStatus") or "")
-                after_status = str(after.get("buyStatus") or "")
-                changed = before_status != after_status or (before_amt != after_amt) or (before_amt is None) != (after_amt is None)
-                if changed:
-                    events.append({
-                        "id": ":".join([str(snapshots[i]["snapshot_date"]), sym, "scope_changed"]),
-                        "type": "scope_changed",
-                        "code": sym,
-                        "name": after.get("fundName") or before.get("fundName") or sym,
-                        "currency": "CNY",
-                        "previousAmount": before_amt,
-                        "currentAmount": after_amt,
-                        "effectiveAt": str(snapshots[i]["snapshot_date"]),
-                    })
-        events.sort(key=lambda e: str(e.get("effectiveAt") or ""), reverse=True)
+        for code, snapshots in by_symbol.items():
+            for index in range(1, len(snapshots)):
+                before = snapshots[index - 1].get("payload") or {}
+                after = snapshots[index].get("payload") or {}
+                before_status, after_status = status_of(before), status_of(after)
+                before_amount = 0 if before_status == "suspended" else amount_of(before)
+                after_amount = 0 if after_status == "suspended" else amount_of(after)
+                event_type = ""
+                if before_status != "suspended" and after_status == "suspended": event_type = "suspend"
+                elif before_status == "suspended" and after_status != "suspended": event_type = "resume"
+                elif before_amount is not None and after_amount is not None and before_amount != after_amount: event_type = "tighten" if after_amount < before_amount else "relax"
+                elif before_status in {"open", "unknown"} and after_status == "limited" and after_amount is not None: event_type = "new_limit"
+                if not event_type: continue
+                effective_at = after.get("effectiveDate") or snapshots[index].get("snapshot_date")
+                events.append({"id": ":".join([str(effective_at or ""), code, event_type]), "type": event_type, "code": code, "name": name_of(code, after), "currency": currency_of(after), "previousAmount": _round4(before_amount), "currentAmount": _round4(after_amount), "effectiveAt": effective_at})
+        events.sort(key=lambda item: str(item.get("effectiveAt") or ""), reverse=True)
+        review_count = sum(item["purchaseStatus"] in {"limited", "suspended"} for item in records)
         return {
-            "schemaVersion": 1,
-            "limitAsOf": latest_date,
-            "coverage": {"covered": len(latest_rows), "total": total_funds, "review": review_count},
-            "currencyTotals": [{
-                "currency": "CNY",
-                "amount": _round4(cny_amount),
-                "fundCount": len(latest_rows),
-                "limitedCount": len(limited_latest),
-            }],
-            "trend": trend,
-            "events": events[:100],
-            "source": "market-collector",
+            "schemaVersion": 1, "limitAsOf": latest_date, "generatedAt": generated_at,
+            "coverage": {"covered": len(records), "total": len(by_symbol), "review": review_count},
+            "currencyTotals": currency_totals, "records": records, "trend": trend,
+            "events": events[:100], "source": "market-collector",
         }
 
     def dataset_record(self, dataset: str, key: str) -> dict[str, Any] | None:
