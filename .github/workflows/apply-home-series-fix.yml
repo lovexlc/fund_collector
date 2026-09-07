@@ -1,0 +1,27 @@
+name: Apply home series completeness fix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/home-series-completeness
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/apply_home_series_fix.py
+      - run: python -m unittest tests.test_aggregates tests.test_http_server tests.test_product_snapshot
+      - name: Commit generated fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add market_collector/aggregates.py tests/test_aggregates.py
+          git commit -m "fix: align local home series with collector buckets"
+          git push origin HEAD:fix/home-series-completeness
