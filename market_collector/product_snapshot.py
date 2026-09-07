@@ -27,6 +27,16 @@ _PRODUCT_COLUMNS = (
     "close_high_point_date", "summary_updated_at",
 )
 
+# Daily fund_summary metrics served only by the local product tables.  The
+# web routes keep these fields on the merged record even when the upstream
+# quote is fresher, so responses always carry the complete metric set.
+SUMMARY_METRIC_KEYS = (
+    "return1w", "return1m", "return3m", "return6m", "return1y",
+    "returnBase", "ytdReturn", "currentYearPercent",
+    "historicalPercentile", "drawdownPercentile",
+    "highDrawdown", "closeHighDrawdown", "highPoint", "closeHighPoint",
+)
+
 
 def _date_text(value: Any) -> str | None:
     if value is None:

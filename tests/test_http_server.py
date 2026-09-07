@@ -262,6 +262,29 @@ class HttpServerTest(unittest.TestCase):
         self.assertEqual(merged["price"], 2.4)
         self.assertEqual(merged["source"], "upstream")
 
+    def test_fresher_upstream_record_keeps_local_summary_metrics(self) -> None:
+        merged = _merge_fresh_record(
+            {
+                "price": 2.4,
+                "asOf": "2026-08-11T11:00:00+08:00",
+                "return1m": 2.3001,
+                "source": "upstream",
+            },
+            {
+                "price": 2.2,
+                "asOf": "2026-08-11T10:00:00+08:00",
+                "return1m": 2.3,
+                "currentYearPercent": 11.78,
+                "highPoint": {"price": 2.087, "highDate": "2026-06-02"},
+                "source": "local",
+            },
+        )
+        self.assertEqual(merged["price"], 2.4)
+        self.assertEqual(merged["source"], "upstream")
+        self.assertEqual(merged["return1m"], 2.3)
+        self.assertEqual(merged["currentYearPercent"], 11.78)
+        self.assertEqual(merged["highPoint"]["price"], 2.087)
+
     def test_invalid_local_timestamp_does_not_replace_timed_upstream_record(self) -> None:
         merged = _merge_fresh_record(
             {"price": 2.4, "asOf": "2026-08-11T11:00:00+08:00"},

@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from .aggregates import MarketDataService
+from .product_snapshot import SUMMARY_METRIC_KEYS
 
 SYMBOL_PATH = re.compile(r"^/symbols/(?P<symbol>\d{6})$")
 KLINE_PATH = re.compile(r"^/klines/(?P<symbol>\d{6})$")
@@ -299,7 +300,15 @@ def _merge_fresh_record(upstream: dict[str, Any], local: dict[str, Any]) -> dict
     upstream_at = _record_timestamp(upstream)
     local_at = _record_timestamp(local)
     if upstream_at is not None and (local_at is None or local_at < upstream_at):
-        return upstream
+        # The fresher upstream record wins for price fields, but the precomputed
+        # fund_summary metrics only exist on the local product snapshot and must
+        # survive the merge even when the upstream quote is newer.
+        merged = dict(upstream)
+        for key in SUMMARY_METRIC_KEYS:
+            value = local.get(key)
+            if value is not None:
+                merged[key] = value
+        return merged
     return _merge_present(upstream, local)
 
 
