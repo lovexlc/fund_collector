@@ -29,8 +29,9 @@ GROUPS = [
         "key": "nasdaq-100", "label": "纳指 100", "order": 10,
         "codes": ["513870", "513390", "513300", "513110", "513100", "159941", "159696", "159660", "159659", "159632", "159513", "159501", "161130"],
     },
-    {"key": "sp500", "label": "标普 500", "order": 20, "codes": ["513500", "513650", "159612", "159655"]},
-    {"key": "us-specialty", "label": "美国主题", "order": 30, "codes": ["159509", "159577", "161128", "513850"]},
+    {"key": "sp500", "label": "标普 500", "order": 20, "codes": ["161125", "513500", "513650", "159612", "159655"]},
+    {"key": "us-50", "label": "美国50", "order": 30, "codes": ["159577", "513850"]},
+    {"key": "nasdaq-tech", "label": "美国科技", "order": 40, "codes": ["159509", "161128"]},
 ]
 
 FetchJson = Callable[[str, float], dict[str, Any]]
@@ -453,41 +454,121 @@ class MarketDataService:
 
     def home_series(self) -> dict[str, Any]:
         latest = self._latest_by_symbol()
-        by_symbol = {symbol: self.intraday_klines(symbol, 240)["candles"] for symbol in SYMBOLS}
+        samples_by_symbol = {symbol: self._raw_samples(symbol) for symbol in SYMBOLS}
+        available_dates = sorted({
+            parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat()
+            for samples in samples_by_symbol.values()
+            for sample in samples
+        })
+        trading_date = available_dates[-1] if available_dates else None
+
+        # home_series 集合的生产口径：只取最近交易日，并以 1 分钟桶最后一个样本为准。
+        # 不能从 168 小时 raw retention 直接截最后 240 个 5 分钟桶，否则会跨交易日。
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        if trading_date:
+            for symbol, samples in samples_by_symbol.items():
+                buckets: dict[str, dict[str, Any]] = {}
+                for sample in samples:
+                    sample_date = parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat()
+                    if sample_date != trading_date:
+                        continue
+                    bucket = bucket_start_iso(str(sample["collected_at"]), 60)
+                    buckets[bucket] = sample
+                points = []
+                for bucket, sample in sorted(buckets.items(), key=lambda item: parse_iso(item[0]).timestamp()):
+                    price = _number(sample.get("price"))
+                    if price is None or price <= 0:
+                        continue
+                    points.append({
+                        "time": bucket,
+                        "date": trading_date,
+                        "price": _round4(price),
+                        "nav": _round4(sample.get("iopv")),
+                        "premiumPercent": _round4(sample.get("computed_premium_percent")),
+                    })
+                by_symbol[symbol] = points
+        else:
+            by_symbol = {symbol: [] for symbol in SYMBOLS}
+
         group_for = {code: group["key"] for group in GROUPS[1:] for code in group["codes"]}
         price_series = []
         premium_series = []
         for symbol in SYMBOLS:
-            rows = by_symbol[symbol]
+            rows = by_symbol.get(symbol) or []
+            if not rows:
+                continue
             name = (latest.get(symbol) or {}).get("name") or symbol
             group_key = group_for.get(symbol, "all")
-            price_series.append({"key": symbol, "code": symbol, "name": name, "groupKey": group_key, "points": [{"time": row["time"], "price": row["c"]} for row in rows]})
-            premium_series.append({"key": symbol, "code": symbol, "name": name, "groupKey": group_key, "points": [{"time": row["time"], "price": row["c"], "nav": row["nav"], "premiumPercent": row["premiumPercent"], "navDate": row["date"]} for row in rows]})
+            price_series.append({
+                "key": symbol, "code": symbol, "name": name, "groupKey": group_key,
+                "points": [{"time": row["time"], "price": row["price"]} for row in rows],
+            })
+            premium_points = [{
+                "time": row["time"], "price": row["price"], "nav": row["nav"],
+                "premiumPercent": row["premiumPercent"], "navDate": trading_date,
+            } for row in rows if row["premiumPercent"] is not None]
+            if premium_points:
+                premium_series.append({
+                    "key": symbol, "code": symbol, "name": name, "groupKey": group_key,
+                    "points": premium_points,
+                })
 
         def aggregate_points(group: dict[str, Any], metric: str) -> list[dict[str, Any]]:
             values: dict[str, list[float]] = defaultdict(list)
             bases: dict[str, float] = {}
             for code in group["codes"]:
-                for row in by_symbol[code]:
-                    value = _number(row["c"] if metric == "price" else row["premiumPercent"])
+                for row in by_symbol.get(code) or []:
+                    value = _number(row["price"] if metric == "price" else row["premiumPercent"])
                     if value is None:
                         continue
                     if metric == "price":
                         bases.setdefault(code, value)
                         value = value / bases[code] * 100
                     values[row["time"]].append(value)
-            return [{"time": key, "value": _round4(statistics.mean(items) if metric == "price" else statistics.median(items))} for key, items in sorted(values.items())]
+            return [
+                {"time": key, "value": _round4(statistics.mean(items) if metric == "price" else statistics.median(items))}
+                for key, items in sorted(values.items()) if items
+            ]
 
-        price_aggregates = [{"key": f"price-equal-weight-{group['key']}", "role": "equal_weight", "label": group["label"] + "等权", "groupKey": group["key"], "normalized": True, "points": aggregate_points(group, "price")} for group in GROUPS]
-        premium_aggregates = [{"key": f"premium-median-{group['key']}", "role": "median", "label": group["label"] + "中位数", "groupKey": group["key"], "points": aggregate_points(group, "premium")} for group in GROUPS]
+        price_aggregates = [{
+            "key": f"price-equal-weight-{group['key']}", "role": "equal_weight",
+            "label": group["label"] + "等权", "groupKey": group["key"],
+            "normalized": True, "points": aggregate_points(group, "price"),
+        } for group in GROUPS]
+        premium_aggregates = [{
+            "key": f"premium-median-{group['key']}", "role": "median",
+            "label": group["label"] + "中位数", "groupKey": group["key"],
+            "points": aggregate_points(group, "premium"),
+        } for group in GROUPS]
+
+        yesterday = None
+        if len(available_dates) > 1:
+            previous_date = available_dates[-2]
+            previous_values = []
+            for samples in samples_by_symbol.values():
+                matching = [sample for sample in samples if parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat() == previous_date]
+                if not matching:
+                    continue
+                value = _number(matching[-1].get("computed_premium_percent"))
+                if value is not None:
+                    previous_values.append(value)
+            if previous_values:
+                yesterday = {
+                    "premiumMedianPercent": _round4(statistics.median(previous_values)),
+                    "tradingDate": previous_date,
+                }
+
         return {
-            "schemaVersion": 1, "bucketMinutes": 5, "windowLabel": "今日 · 5 分钟", "defaultGroupKey": "all",
+            "schemaVersion": 1, "tradingDate": trading_date,
+            "bucketMinutes": 1, "windowLabel": "今日 · 1 分钟", "defaultGroupKey": "all",
             "generatedAt": _shanghai_iso(datetime.now(timezone.utc)),
             "groups": [{key: value for key, value in group.items() if key != "codes"} for group in GROUPS],
+            "yesterday": yesterday,
             "modes": {
                 "price": {"aggregate": {"series": price_aggregates}, "series": price_series},
                 "premium": {"aggregate": {"series": premium_aggregates}, "series": premium_series},
             },
+            "source": f"market-collector-{self.store.backend_name}-1m",
         }
 
     def market_summary(self, region: str) -> dict[str, Any] | None:
