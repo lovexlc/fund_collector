@@ -128,9 +128,21 @@ class FundProductStore(FundStore):
   s.high_drawdown,s.close_high_drawdown,s.high_point,s.high_point_date,
   s.close_high_point,s.close_high_point_date,s.updated_at AS summary_updated_at
 FROM fund_quote q
-LEFT JOIN fund_summary s
-  ON s.code=q.code
- AND s.date=(SELECT MAX(s2.date) FROM fund_summary s2 WHERE s2.code=q.code)"""
+LEFT JOIN (
+  SELECT s1.code, s1.date, s1.latest_nav,
+         s1.return_1w, s1.return_1m, s1.return_3m, s1.return_6m,
+         s1.return_1y, s1.return_base, s1.ytd_return,
+         s1.historical_percentile, s1.drawdown_percentile,
+         s1.high_drawdown, s1.close_high_drawdown,
+         s1.high_point, s1.high_point_date,
+         s1.close_high_point, s1.close_high_point_date, s1.updated_at
+  FROM fund_summary s1
+  JOIN (
+    SELECT code, MAX(date) AS max_date
+    FROM fund_summary
+    GROUP BY code
+  ) latest ON latest.code = s1.code AND latest.max_date = s1.date
+) s ON s.code = q.code"""
         try:
             # FundStore uses a shared non-autocommit connection.  Serialize the
             # complete read and end the previous snapshot before selecting so
