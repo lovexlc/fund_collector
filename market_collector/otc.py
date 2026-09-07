@@ -1,17 +1,22 @@
+"""场外基金采集：蛋卷直连版（不再经过 CF workers）。
+
+每晚定时拉 OTC/QDII 基金详情（净值/涨幅/区间收益/类型），
+写入 data 目录的 otc-latest.json 供产品表与 API 兜底使用。
+"""
 from __future__ import annotations
 
 import json
 import os
 import tempfile
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
+from .danjuan import build_otc_item, fetch_fund_detail
+
 SHANGHAI = ZoneInfo("Asia/Shanghai")
-FUND_METRICS_URL = "https://api.freebacktrack.tech/api/markets/fund-metrics"
 
 OTC_SYMBOLS = [
     "000834", "008971", "270042", "006479", "000055", "006480", "021778", "161130",
@@ -27,66 +32,46 @@ OTC_SYMBOLS = [
     "012861",
 ]
 
-PostJson = Callable[[str, dict[str, Any], float], dict[str, Any]]
+FetchDetail = Callable[[str, float], dict[str, Any] | None]
 
 
-def post_json(url: str, payload: dict[str, Any], timeout_sec: float) -> dict[str, Any]:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={"accept": "application/json", "content-type": "application/json", "user-agent": "market-collector/1"},
-    )
-    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-        return json.loads(response.read().decode("utf-8", "replace"))
-
-
-def _to_shanghai(value: Any) -> Any:
-    text = str(value or "").strip()
-    if not text:
-        return value
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(SHANGHAI).isoformat(timespec="seconds")
-    except ValueError:
-        return value
-
-
-def _fetch_batch(codes: list[str], timeout_sec: float, client: PostJson) -> dict[str, Any]:
-    # 不传 fundKinds：fund-metrics 接口内部从 danjuan type_desc 自动判定 QDII/OTC。
-    # 之前硬编码 {code: "qdii" for code in codes} 在 OTC_SYMBOLS 全是 QDII 时正确，
-    # 但加入纯 A 股场外基金时会错标 qdii（T-1），导致净值日期口径错误。
-    return client(FUND_METRICS_URL, {
-        "codes": codes,
-    }, timeout_sec)
+def _fetch_one(code: str, timeout_sec: float, fetch_detail: FetchDetail, collected_at: str) -> dict[str, Any] | None:
+    detail = fetch_detail(code, timeout_sec)
+    if not isinstance(detail, dict):
+        raise ValueError("danjuan detail unavailable")
+    return build_otc_item(detail, collected_at)
 
 
 def fetch_otc_metrics(
     symbols: list[str] | None = None,
     timeout_sec: float = 30.0,
-    client: PostJson = post_json,
+    fetch_detail: FetchDetail = fetch_fund_detail,
 ) -> dict[str, Any]:
+    """逐只直连蛋卷详情，输出与旧 worker 版同构的 otc-latest 载荷。"""
     codes = list(dict.fromkeys(symbols or OTC_SYMBOLS))
-    batches = [codes[index:index + 20] for index in range(0, len(codes), 20)]
-    items: list[dict[str, Any]] = []
+    collected_at = datetime.now(timezone.utc).astimezone(SHANGHAI).isoformat(timespec="seconds")
+    by_code: dict[str, dict[str, Any]] = {}
     errors: list[str] = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(_fetch_batch, batch, timeout_sec, client): batch for batch in batches}
+    workers = max(1, min(4, len(codes))) if codes else 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {
+            executor.submit(_fetch_one, code, timeout_sec, fetch_detail, collected_at): code
+            for code in codes
+        }
         for future in as_completed(futures):
+            code = futures[future]
             try:
-                payload = future.result()
-                for item in payload.get("items") or []:
-                    normalized = dict(item)
-                    for key in ("asOf", "updatedAt", "expiresAt"):
-                        if key in normalized:
-                            normalized[key] = _to_shanghai(normalized[key])
-                    items.append(normalized)
+                item = future.result()
+                if item is None:
+                    errors.append(f"{code}: danjuan detail without nav")
+                else:
+                    by_code[code] = item
             except Exception as exc:
-                errors.append(f"{','.join(futures[future])}: {exc}")
-    by_code = {str(item.get("code") or item.get("symbol")): item for item in items}
+                errors.append(f"{code}: {exc}")
     ordered = [by_code[code] for code in codes if code in by_code]
     return {
         "kind": "market-collector-otc-latest",
-        "generated_at": datetime.now(timezone.utc).astimezone(SHANGHAI).isoformat(timespec="seconds"),
+        "generated_at": collected_at,
         "requested": len(codes), "success_count": len(ordered),
         "failure_count": len(codes) - len(ordered), "errors": errors, "items": ordered,
     }

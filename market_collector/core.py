@@ -11,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .calendar_cn import is_trading_day
-from .fund_reference import fetch_fund_references, fetch_fund_limit_overview
+from .fund_reference import fetch_fund_references
 from .otc import OTC_SYMBOLS, atomic_write_json, fetch_otc_metrics
 from .publish import build_publisher
 from .sources import fetch_eastmoney_references, fetch_tencent_quotes, isoformat_z, normalize_symbol
@@ -269,7 +269,6 @@ class MarketCollector:
         fee_symbols = list(dict.fromkeys(otc_symbols + etf_symbols))
         payload = fetch_fund_references(
             symbols=otc_symbols,
-            worker_url=str(sync_config.get("worker_url") or "https://api.freebacktrack.tech"),
             timeout_sec=float(sync_config.get("request_timeout_sec") or 25),
             concurrency=int(sync_config.get("concurrency") or 4),
             now=now,
@@ -607,80 +606,92 @@ class MarketCollector:
         return trend
 
     def _publish_limit_overview(self) -> int:
-        """每日：从 ocr-proxy 拉场外限额聚合快照（含事件/趋势）写入 fund_limit_overview_snapshot。"""
-        if self.fund_store is None:
+        """每日：用本地 fund_limit 快照历史重建限额总览（不再回源 workers）。"""
+        if self.fund_store is None or self.store is None:
             return 0
-        sync_config = self.config.get("fund_reference_sync") or {}
-        worker_url = str(sync_config.get("worker_url") or "https://api.freebacktrack.tech")
-        timeout = float(sync_config.get("request_timeout_sec") or 25)
         try:
-            payload = fetch_fund_limit_overview(worker_url, timeout)
+            history = self.store.read_fund_reference_history("fund_limit", 30)
         except Exception as exc:
-            print(f"[fund-store] fetch_fund_limit_overview failed: {exc}", flush=True)
+            print(f"[fund-store] read_fund_reference_history failed: {exc}", flush=True)
             return 0
-        # collector 自己的 fund_limit 历史快照生成有金额变化的 events，
-        # 替换 ocr-proxy 的脏 events（scope_changed 噪音 + 缺失 tighten/relax）。
-        name_map = {}
-        for record in (payload.get('records') or []):
-            code = str(record.get('code') or '')
-            name = str(record.get('fundName') or record.get('name') or '')
-            if code and name:
+        if not history:
+            print("[fund-store] limit overview skipped: no local snapshots yet", flush=True)
+            return 0
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        for row in history:
+            by_symbol.setdefault(str(row["symbol"]), []).append(row)
+        for snapshots in by_symbol.values():
+            snapshots.sort(key=lambda item: str(item["snapshot_date"]))
+        latest_date = max(str(row["snapshot_date"]) for row in history)
+        name_map: dict[str, str] = {}
+        records: list[dict[str, Any]] = []
+        limited_cny = 0.0
+        limited_count = 0
+        for code, snapshots in by_symbol.items():
+            payload = dict(snapshots[-1].get("payload") or {})
+            if not payload:
+                continue
+            name = str(payload.get("fundName") or payload.get("name") or "")
+            if name:
                 name_map[code] = name
-        collector_events = self._build_limit_events_from_snapshots(30, name_map)
-        if collector_events:
-            payload['events'] = collector_events
-            payload['recentEvents'] = collector_events
-            print(f"[fund-store] replaced limit events: {len(collector_events)} from snapshots", flush=True)
-        # collector 历史快照重算 trend，修正 suspended 残留断崖
-        collector_trend = self._build_limit_trend_from_snapshots(30)
-        if collector_trend:
-            payload["trend"] = collector_trend
-            # 用 trend 最新一天的 totalByCurrency 同步 summary，让 currencyTotals 与 trend
-            # 口径一致（都是「所有 limit_large 基金单日限额之和」）。
-            # ocr-proxy 的 summary.totalByCurrency 来自 quotaGroups 去重聚合（只算 eligible
-            # 的 quotaGroup），与 trend 逐基金累加口径冲突，用户会看到「额度140 / 趋势790」矛盾。
-            latest_totals = collector_trend[-1].get('totalByCurrency') or {}
-            summary = payload.get('summary') or {}
-            summary['totalByCurrency'] = latest_totals
-            payload['summary'] = summary
-            print(f"[fund-store] replaced limit trend: {len(collector_trend)} days, totals={latest_totals}", flush=True)
+            records.append(payload)
+            status = str(payload.get("buyStatus") or "")
+            if status and status != "open":
+                limited_count += 1
+                try:
+                    limited_cny += float(payload.get("maxPurchasePerDay") or 0)
+                except (TypeError, ValueError):
+                    pass
+        events = self._build_limit_events_from_snapshots(30, name_map)
+        trend = self._build_limit_trend_from_snapshots(30)
+        latest_totals = trend[-1].get("totalByCurrency") if trend else {}
+        payload = {
+            "schemaVersion": 1,
+            "limitAsOf": latest_date,
+            "records": records,
+            # summary/currencyTotals 与 trend 逐基金累加口径一致（都是限额之和）。
+            "summary": {"totalByCurrency": latest_totals or {"CNY": round(limited_cny, 2)}},
+            "currencyTotals": [{
+                "currency": "CNY", "amount": round(limited_cny, 2), "limitedCount": limited_count,
+            }],
+            "trend": trend,
+            "events": events[:100],
+            "recentEvents": events[:20],
+            "source": "market-collector-local",
+        }
+        print(
+            f"[fund-store] limit overview rebuilt locally: records={len(records)} "
+            f"trend={len(trend)} events={len(events)}",
+            flush=True,
+        )
         return self.fund_store.upsert_limit_overview(payload)
 
     def _fetch_nav_history_rows(self, codes: list[str]) -> list[dict[str, Any]]:
-        """拉历史净值 K 线（增量，只取最近未入库的）。"""
-        import urllib.parse
-        import urllib.request
-        import json as _json
-        from .sources import isoformat_z as _iso
+        """拉历史净值（蛋卷直连，一次拉全量窗口后入库）。"""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from .danjuan import fetch_nav_history as fetch_dj_nav
         timeout = float((self.config.get("fund_reference_sync") or {}).get("request_timeout_sec") or 25)
-        today = datetime.now(SHANGHAI).date().isoformat()
+        # 2024-01-01 起约 650 个交易日，size=700 覆盖到起始日还有余量。
+        size = 700
+
+        def one(code: str) -> list[dict[str, Any]]:
+            series = fetch_dj_nav(code, size, timeout)
+            return [
+                {"code": code, "date": row["date"], "nav": row["nav"], "source": "danjuan-nav-history"}
+                for row in series if row["date"] >= "2024-01-01"
+            ]
+
         out: list[dict[str, Any]] = []
-        for i in range(0, len(codes), 5):
-            batch = codes[i:i + 5]
-            body = _json.dumps({"codes": batch, "from": "2024-01-01", "to": today}).encode()
-            req = urllib.request.Request(
-                "https://api.freebacktrack.tech/api/holdings/nav-history",
-                data=body, method="POST",
-                headers={"content-type": "application/json", "user-agent": "curl/8.4.0"},
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=timeout) as r:
-                    payload = _json.loads(r.read().decode("utf-8", "replace"))
-            except Exception as exc:
-                print(f"[fund-store] nav-history batch fail: {exc}", flush=True)
-                continue
-            for entry in (payload.get("items") or []):
-                code = str(entry.get("code") or "")
-                rows = ((entry.get("data") or {}).get("items")) or []
-                for row in rows:
-                    nav = row.get("nav")
-                    try:
-                        nav_f = float(nav)
-                    except (TypeError, ValueError):
-                        continue
-                    if not (nav_f > 0):
-                        continue
-                    out.append({"code": code, "date": str(row.get("date") or "")[:10], "nav": nav_f, "source": "holdings-nav-history"})
+        workers = max(1, min(4, len(codes))) if codes else 1
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(one, code): code for code in codes}
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    out.extend(future.result())
+                except Exception as exc:
+                    print(f"[fund-store] nav-history {code} fail: {exc}", flush=True)
         return out
 
     def _fetch_history_close_rows(self, symbol: str, limit: int = 3000) -> list[dict[str, Any]]:
@@ -890,26 +901,45 @@ class MarketCollector:
             return 0
         return self._upsert_quotes_fast(rows)
 
+    def _connect_high_freq(self, target: dict[str, Any]) -> Any:
+        import os
+        import pymysql
+        password = ""
+        pw_file = str(target.get("password_file") or "").strip()
+        pw_env = str(target.get("password_env") or "").strip()
+        if pw_env:
+            password = os.environ.get(pw_env, "")
+        if not password and pw_file:
+            password = Path(pw_file).read_text(encoding="utf-8").strip()
+        return pymysql.connect(
+            host=target["host"],
+            port=int(target.get("port") or 4000),
+            user=target["user"],
+            password=password,
+            database=target.get("database") or "ai_dca_market",
+            ssl_verify_cert=True,
+            ssl_verify_identity=True,
+            ssl_ca=target.get("ssl_ca") or "/etc/ssl/certs/ca-certificates.crt",
+            autocommit=True,
+            charset="utf8mb4",
+        )
+
     def _upsert_quotes_fast(self, rows: list[dict[str, Any]]) -> int:
-        """高频写入：完全独立于 fund_store，直接从 config 读 TiDB target 建连接。
+        """高频写入：复用持久 autocommit 连接，多值单条 INSERT upsert fund_quote（只写本地产品表）。
 
         fund_store.initialize() 会建立 autocommit=False 的连接并污染同用户会话状态，
         导致后续新建的 autocommit=True 连接写入无法跨连接可见（同连接可读、跨连接不可见）。
-        本方法不依赖 self.fund_store，避免污染。
+        本方法不依赖 self.fund_store；且不再每拍重建连接（TiDB TLS 建连 ~2s 是旧 3s+ 拍长的大头）。
+        逐行 execute 每行一次远端往返（23 行 ≈ 2.3s），多值单条把整拍压到一次往返（<0.2s），
+        这是 quote-beat 1s 周期能成立的关键。
         """
-        import pymysql
-        import os
         from .fund_store import _shanghai_iso, _num, _date_str
         storage_cfg = (self.config.get("storage") or {}).get("tidb") or self.config.get("tidb") or {}
         raw_targets = storage_cfg.get("targets") or []
         if not raw_targets:
             return 0
         target = raw_targets[0]
-        sql = """INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,change_amount,change_percent,premium_percent,iopv,volume,turnover,market_state,as_of,session,suspended,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),market_state=VALUES(market_state),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
-        import pymysql
-        import os
-        from .fund_store import _shanghai_iso, _num, _date_str
+        on_duplicate = """ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(latest_nav),latest_nav_date=VALUES(latest_nav_date),previous_close=VALUES(previous_close),change_amount=VALUES(change_amount),change_percent=VALUES(change_percent),premium_percent=VALUES(premium_percent),iopv=VALUES(iopv),volume=VALUES(volume),turnover=VALUES(turnover),market_state=VALUES(market_state),as_of=VALUES(as_of),session=VALUES(session),suspended=VALUES(suspended),updated_at=VALUES(updated_at)"""
         now = _shanghai_iso(datetime.now(timezone.utc))
         mapped = []
         for r in rows:
@@ -935,40 +965,44 @@ ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(
             ))
         if not mapped:
             return 0
-        password = ""
-        pw_file = str(target.get("password_file") or "").strip()
-        pw_env = str(target.get("password_env") or "").strip()
-        if pw_env:
-            password = os.environ.get(pw_env, "")
-        if not password and pw_file:
-            password = Path(pw_file).read_text(encoding="utf-8").strip()
+        # 多值单条 INSERT：所有行一次往返提交，避免逐行 execute 的 N 次远端 RTT。
+        row_placeholder = "(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
+        values_sql = ",".join([row_placeholder for _ in mapped])
+        sql = (
+            "INSERT INTO fund_quote (code,name,price,latest_nav,latest_nav_date,previous_close,"
+            "change_amount,change_percent,premium_percent,iopv,volume,turnover,market_state,as_of,"
+            "session,suspended,updated_at) VALUES " + values_sql + " " + on_duplicate
+        )
+        params: list[Any] = [field for row in mapped for field in row]
         conn = None
-        try:
-            conn = pymysql.connect(
-                host=target["host"],
-                port=int(target.get("port") or 4000),
-                user=target["user"],
-                password=password,
-                database=target.get("database") or "ai_dca_market",
-                ssl_verify_cert=True,
-                ssl_verify_identity=True,
-                ssl_ca=target.get("ssl_ca") or "/etc/ssl/certs/ca-certificates.crt",
-                autocommit=True,
-                charset="utf8mb4",
-            )
-            with conn.cursor() as cur:
-                for row in mapped:
-                    cur.execute(sql, row)
-            return len(mapped)
-        except Exception as exc:
-            print(f"[high-freq] write failed: {exc}", flush=True)
-            return 0
-        finally:
-            if conn is not None:
+        with self._high_freq_conn_lock:
+            try:
+                conn = self._high_freq_conn
+                if conn is None:
+                    conn = self._connect_high_freq(target)
+                    self._high_freq_conn = conn
+                else:
+                    try:
+                        conn.ping(reconnect=True)
+                    except Exception:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = self._connect_high_freq(target)
+                        self._high_freq_conn = conn
+                with conn.cursor() as cur:
+                    cur.execute(sql, params)
+                return len(mapped)
+            except Exception as exc:
+                print(f"[high-freq] write failed: {exc}", flush=True)
+                self._high_freq_conn = None
                 try:
-                    conn.close()
+                    if conn is not None:
+                        conn.close()
                 except Exception:
                     pass
+                return 0
 
     def _iopv_loop(self) -> None:
         """低频线程主循环：交易时段每 5s 刷新 iopv 缓存。"""
@@ -982,7 +1016,7 @@ ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(
             self._high_freq_stop.wait(5.0)
 
     def _quote_loop(self) -> None:
-        """高频线程主循环：交易时段每 1s 刷新 fund_quote。"""
+        """高频线程主循环：交易时段每 1s 一个周期（起止对齐），只写本地 fund_quote。"""
         while not self._high_freq_stop.is_set():
             now = datetime.now(timezone.utc)
             if classify_session(now) == "trading":
@@ -992,7 +1026,10 @@ ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(
                     print(f"[quote-beat] upsert={n} dt={time.time()-t0:.2f}s {isoformat_z(now)}", flush=True)
                 except Exception as exc:
                     print(f"[high-freq] quote loop error: {exc}", flush=True)
-            self._high_freq_stop.wait(1.0)
+                # 周期对齐 1s：工作耗时从等待里扣除，保证起拍间隔恒定 1s 而不是 工作耗时+1s。
+                self._high_freq_stop.wait(max(0.0, 1.0 - (time.time() - t0)))
+            else:
+                self._high_freq_stop.wait(1.0)
 
     def run_forever(self) -> None:
         # 高频行情线程：quote 1s / iopv 5s，仅在交易时段运行

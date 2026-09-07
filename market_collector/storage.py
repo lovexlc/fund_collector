@@ -110,6 +110,20 @@ class MarketStore(Protocol):
     ) -> list[dict[str, Any]]:
         ...
 
+    def write_nav_daily(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, Any]],
+        retention_days: int = 3650,
+    ) -> None:
+        ...
+
+    def read_nav_daily(self, symbol: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+        ...
+
+    def latest_nav_date(self, symbol: str) -> str | None:
+        ...
+
 
 @dataclass(frozen=True)
 class ReplicaOutboxItem:
@@ -234,6 +248,17 @@ class SQLiteStore:
                     enqueued_at TEXT NOT NULL,
                     PRIMARY KEY (replica_id, data_kind, symbol, snapshot_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS nav_daily (
+                    symbol TEXT NOT NULL,
+                    nav_date TEXT NOT NULL,
+                    nav REAL NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, nav_date)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_nav_daily_date
+                ON nav_daily (symbol, nav_date DESC);
                 """
             )
 
@@ -454,11 +479,10 @@ class SQLiteStore:
                 """,
                 [data_kind, *normalized],
             ).fetchall()
-        expected_source = "worker:" + data_kind.replace("_", "-")
         latest: dict[str, dict[str, Any]] = {}
         for row in rows:
             symbol = str(row["symbol"])
-            if symbol in latest or str(row["source"]) != expected_source:
+            if symbol in latest or not str(row["source"]).startswith(("worker:", "direct:")):
                 continue
             try:
                 payload = json.loads(str(row["payload_json"]))
@@ -486,10 +510,10 @@ class SQLiteStore:
                 """,
                 (data_kind, cutoff),
             ).fetchall()
-        expected_source = "worker:" + data_kind.replace("_", "-")
         out: list[dict[str, Any]] = []
         for row in rows:
-            if str(row["source"]) != expected_source:
+            # 历史数据 source 为 worker:*，直连采集（东财/蛋卷）后新增 direct:* 记录。
+            if not str(row["source"]).startswith(("worker:", "direct:")):
                 continue
             try:
                 payload = json.loads(str(row["payload_json"]))
@@ -502,6 +526,72 @@ class SQLiteStore:
                     "payload": payload,
                 })
         return out
+
+    def write_nav_daily(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, Any]],
+        retention_days: int = 3650,
+    ) -> None:
+        normalized = str(symbol or "").strip()
+        if not re.fullmatch(r"\d{6}", normalized):
+            return
+        seen: dict[str, float] = {}
+        for row in rows or []:
+            nav_date = str(row.get("date") or "")[:10]
+            try:
+                nav = float(row.get("nav"))
+            except (TypeError, ValueError):
+                continue
+            if not nav_date or nav != nav or nav <= 0:
+                continue
+            seen[nav_date] = round(nav, 4)
+        if not seen:
+            return
+        fetched_at = datetime.now(SHANGHAI).isoformat(timespec="seconds")
+        cutoff = (datetime.now(SHANGHAI).date() - timedelta(days=max(1, int(retention_days)))).isoformat()
+        with closing(self.connect()) as conn:
+            with conn:
+                conn.execute(
+                    "DELETE FROM nav_daily WHERE symbol = ? AND nav_date < ?",
+                    (normalized, cutoff),
+                )
+                conn.executemany(
+                    """
+                    INSERT INTO nav_daily (symbol, nav_date, nav, fetched_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(symbol, nav_date) DO UPDATE SET
+                      nav = excluded.nav, fetched_at = excluded.fetched_at
+                    """,
+                    [(normalized, nav_date, nav, fetched_at) for nav_date, nav in seen.items()],
+                )
+
+    def read_nav_daily(self, symbol: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+        normalized = str(symbol or "").strip()
+        if not re.fullmatch(r"\d{6}", normalized):
+            return []
+        with closing(self.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT nav_date, nav
+                FROM nav_daily
+                WHERE symbol = ? AND nav_date BETWEEN ? AND ? AND nav > 0
+                ORDER BY nav_date ASC
+                """,
+                (normalized, str(from_date), str(to_date)),
+            ).fetchall()
+        return [{"date": str(row["nav_date"]), "nav": float(row["nav"])} for row in rows]
+
+    def latest_nav_date(self, symbol: str) -> str | None:
+        normalized = str(symbol or "").strip()
+        if not re.fullmatch(r"\d{6}", normalized):
+            return None
+        with closing(self.connect()) as conn:
+            row = conn.execute(
+                "SELECT MAX(nav_date) AS latest FROM nav_daily WHERE symbol = ?",
+                (normalized,),
+            ).fetchone()
+        return str(row["latest"]) if row and row["latest"] else None
 
     def enqueue_fund_reference_replicas(
         self,
@@ -1308,7 +1398,6 @@ class ShardedTiDBStore:
         if not normalized:
             return {}
         latest: dict[str, dict[str, Any]] = {}
-        expected_source = "worker:" + data_kind.replace("_", "-")
         with self._lock:
             if not self._initialized:
                 self.initialize()
@@ -1333,7 +1422,7 @@ class ShardedTiDBStore:
                         )
                         for row in cursor.fetchall():
                             symbol = str(row[0])
-                            if symbol in latest or str(row[1]) != expected_source:
+                            if symbol in latest or not str(row[1]).startswith(("worker:", "direct:")):
                                 continue
                             raw = row[2]
                             try:
@@ -1373,7 +1462,7 @@ class ShardedTiDBStore:
                             (data_kind, cutoff),
                         )
                         for row in cursor.fetchall():
-                            if str(row[2]) != "worker:" + data_kind.replace("_", "-"):
+                            if not str(row[2]).startswith(("worker:", "direct:")):
                                 continue
                             raw = row[3]
                             try:
@@ -1389,6 +1478,21 @@ class ShardedTiDBStore:
                                     "payload": payload,
                                 })
         return out
+
+    def write_nav_daily(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, Any]],
+        retention_days: int = 3650,
+    ) -> None:
+        # nav_daily 是 sqlite 本地缓存（dual 模式下读走 primary），TiDB 侧不落库。
+        return
+
+    def read_nav_daily(self, symbol: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+        return []
+
+    def latest_nav_date(self, symbol: str) -> str | None:
+        return None
 
 
 class DualWriteStore:
@@ -1525,6 +1629,20 @@ class DualWriteStore:
         days: int,
     ) -> list[dict[str, Any]]:
         return self.primary.read_fund_reference_history(data_kind, days)
+
+    def write_nav_daily(
+        self,
+        symbol: str,
+        rows: Sequence[Mapping[str, Any]],
+        retention_days: int = 3650,
+    ) -> None:
+        self.primary.write_nav_daily(symbol, rows, retention_days)
+
+    def read_nav_daily(self, symbol: str, from_date: str, to_date: str) -> list[dict[str, Any]]:
+        return self.primary.read_nav_daily(symbol, from_date, to_date)
+
+    def latest_nav_date(self, symbol: str) -> str | None:
+        return self.primary.latest_nav_date(symbol)
 
 
 def build_store(config: Mapping[str, Any]) -> MarketStore:

@@ -16,12 +16,11 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .core import SYMBOLS, classify_session
+from .danjuan import fetch_nav_history as fetch_danjuan_nav_history
 from .storage import MarketStore, bucket_start_iso, parse_iso
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 EASTMONEY_KLINE_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-NAV_HISTORY_URL = "https://api.freebacktrack.tech/api/holdings/nav-history"
-MARKETS_KLINE_URL = "https://api.freebacktrack.tech/api/markets/kline"
 
 GROUPS = [
     {"key": "all", "label": "全部", "order": 0, "codes": list(SYMBOLS)},
@@ -29,8 +28,9 @@ GROUPS = [
         "key": "nasdaq-100", "label": "纳指 100", "order": 10,
         "codes": ["513870", "513390", "513300", "513110", "513100", "159941", "159696", "159660", "159659", "159632", "159513", "159501", "161130"],
     },
-    {"key": "sp500", "label": "标普 500", "order": 20, "codes": ["513500", "513650", "159612", "159655"]},
-    {"key": "us-specialty", "label": "美国主题", "order": 30, "codes": ["159509", "159577", "161128", "513850"]},
+    {"key": "sp500", "label": "标普 500", "order": 20, "codes": ["161125", "513500", "513650", "159612", "159655"]},
+    {"key": "us-50", "label": "美国50", "order": 30, "codes": ["159577", "513850"]},
+    {"key": "nasdaq-tech", "label": "美国科技", "order": 40, "codes": ["159509", "161128"]},
 ]
 
 FetchJson = Callable[[str, float], dict[str, Any]]
@@ -51,16 +51,18 @@ def _round4(value: Any) -> float | None:
 
 
 def _fetch_json(url: str, timeout_sec: float) -> dict[str, Any]:
-    request = urllib.request.Request(url, headers={
-        "accept": "application/json",
-        "user-agent": "Mozilla/5.0 market-collector/1",
-        "referer": "https://quote.eastmoney.com/",
-    })
+    # 经 netutil：东财（push2his 日 K）直连被 WAF 拦截时走机器级出口代理重试。
+    from .netutil import fetch_url
+
     last_error: Exception | None = None
     for attempt in range(3):
         try:
-            with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-                return json.loads(response.read().decode("utf-8", "replace"))
+            raw = fetch_url(url, timeout_sec, headers={
+                "accept": "application/json",
+                "user-agent": "Mozilla/5.0 market-collector/1",
+                "referer": "https://quote.eastmoney.com/",
+            })
+            return json.loads(raw.decode("utf-8", "replace"))
         except Exception as exc:
             last_error = exc
             if attempt < 2:
@@ -218,22 +220,19 @@ class MarketDataService:
         metrics = {code: self.fund_metric(code) for code in codes}
         if not codes:
             return []
-        today = datetime.now(SHANGHAI).date()
-        start = today - timedelta(days=45)
 
         def load_navs() -> dict[str, list[dict[str, Any]]]:
-            payload = self.post_json(NAV_HISTORY_URL, {
-                "codes": codes, "from": start.isoformat(), "to": today.isoformat(),
-            }, self.timeout_sec)
+            # 蛋卷直连（不再回源 workers）；单只缓存 30 分钟，避免 fund-metrics 批量重复拉取。
             result: dict[str, list[dict[str, Any]]] = {}
-            for entry in payload.get("items") or []:
-                code = str(entry.get("code") or "")
-                rows = ((entry.get("data") or {}).get("items")) or []
-                valid = [
-                    {"date": str(row.get("date") or "")[:10], "nav": _round4(row.get("nav"))}
-                    for row in rows if _number(row.get("nav")) is not None and _number(row.get("nav")) > 0
-                ]
-                result[code] = valid
+            for nav_code in missing_nav_codes:
+                series = self.cache.get_or_load(
+                    "dj-nav:" + nav_code, 1800,
+                    lambda code=nav_code: fetch_danjuan_nav_history(code, 90, self.timeout_sec),
+                )
+                if series:
+                    result[nav_code] = [
+                        {"date": row["date"], "nav": _round4(row["nav"])} for row in series
+                    ]
             return result
 
         cache_key = "latest-navs:" + ",".join(sorted(codes))
@@ -314,22 +313,9 @@ class MarketDataService:
         })
 
         def load() -> dict[str, Any]:
-            fallback_params = urllib.parse.urlencode({"tf": "1d", "limit": limit})
-            try:
-                fallback = self.fetch_json(f"{MARKETS_KLINE_URL}/{symbol}?{fallback_params}", self.timeout_sec)
-                rows = []
-                for item in fallback.get("candles") or []:
-                    candle_date = str(item.get("date") or datetime.fromtimestamp(float(item.get("t") or 0), SHANGHAI).date().isoformat())[:10]
-                    rows.append(",".join(str(value if value is not None else "") for value in [
-                        candle_date, item.get("o"), item.get("c"), item.get("h"), item.get("l"),
-                        item.get("v"), item.get("amount"), item.get("amplitudePercent"),
-                        item.get("changePercent"), item.get("change"), item.get("turnoverRate"),
-                    ]))
-                raw = {"data": {"name": fallback.get("name") or symbol, "klines": rows}}
-                source = "markets-worker"
-            except Exception:
-                raw = self.fetch_json(EASTMONEY_KLINE_URL + "?" + params, min(self.timeout_sec, 3.0))
-                source = "eastmoney-push2his-fallback"
+            # 东财直连（push2his 日 K），不再回源 workers；失败直接抛错由调用方处理。
+            raw = self.fetch_json(EASTMONEY_KLINE_URL + "?" + params, self.timeout_sec)
+            source = "eastmoney-push2his"
             data = raw.get("data") or {}
             candles = []
             for line in data.get("klines") or []:
@@ -354,24 +340,53 @@ class MarketDataService:
 
         return self.cache.get_or_load(f"daily:{symbol}:{limit}", 300, load)
 
+    def nav_series(self, symbol: str, from_date: date, to_date: date) -> list[dict[str, Any]]:
+        """NAV 日线序列：本地 nav_daily 优先；缺失/过期时蛋卷直连补一次并落库。
+
+        新鲜度：最新 NAV 距 to_date 不超过 3 天（容忍周末与节假日）。
+        覆盖度：本地最早一条不晚于 from_date+7 天，否则视为覆盖不足需回源补全。
+        """
+        normalized = str(symbol or "").strip()
+        if not (normalized.isdigit() and len(normalized) == 6):
+            return []
+        rows = self.store.read_nav_daily(normalized, from_date.isoformat(), to_date.isoformat())
+        covers = bool(rows) and rows[0]["date"] <= (from_date + timedelta(days=7)).isoformat()
+        fresh = bool(rows) and rows[-1]["date"] >= (to_date - timedelta(days=3)).isoformat()
+        if covers and fresh:
+            return rows
+        span = (to_date - from_date).days + 60
+        fetched_all = self.cache.get_or_load(
+            f"dj-nav-full:{normalized}", 1800,
+            lambda: fetch_danjuan_nav_history(normalized, max(90, min(span, 2000)), self.timeout_sec),
+        )
+        fetched = [
+            row for row in fetched_all
+            if from_date.isoformat() <= row["date"] <= to_date.isoformat()
+        ]
+        if fetched_all:
+            try:
+                # 全量落库（不止当前窗口），后续任意窗口直接命中本地。
+                self.store.write_nav_daily(normalized, fetched_all)
+            except Exception:
+                pass
+        if fetched:
+            return fetched
+        return rows
+
     def nav_history(self, symbol: str, days: int = 365) -> dict[str, Any]:
         days = max(1, min(days, 3650))
         to_date = datetime.now(SHANGHAI).date()
         from_date = to_date - timedelta(days=days)
-        params = urllib.parse.urlencode({"code": symbol, "from": from_date.isoformat(), "to": to_date.isoformat()})
 
         def load() -> dict[str, Any]:
-            payload = self.fetch_json(NAV_HISTORY_URL + "?" + params, self.timeout_sec)
-            items = []
-            for item in payload.get("items") or []:
-                nav_date = str(item.get("date") or "")[:10]
-                nav = _number(item.get("nav"))
-                if nav_date and nav is not None and nav > 0:
-                    items.append({"date": nav_date, "t": _date_epoch(nav_date), "nav": _round4(nav)})
+            items = [
+                {"date": row["date"], "t": _date_epoch(row["date"]), "nav": _round4(row["nav"])}
+                for row in self.nav_series(symbol, from_date, to_date)
+            ]
             return {
                 "symbol": symbol, "from": from_date.isoformat(), "to": to_date.isoformat(),
-                "generatedAt": payload.get("generatedAt") or _shanghai_iso(datetime.now(timezone.utc)),
-                "source": "holdings-nav-history", "items": items,
+                "generatedAt": _shanghai_iso(datetime.now(timezone.utc)),
+                "source": "market-collector-nav-daily", "items": items,
             }
 
         return self.cache.get_or_load(f"nav:{symbol}:{days}", 1800, load)
@@ -453,41 +468,121 @@ class MarketDataService:
 
     def home_series(self) -> dict[str, Any]:
         latest = self._latest_by_symbol()
-        by_symbol = {symbol: self.intraday_klines(symbol, 240)["candles"] for symbol in SYMBOLS}
+        samples_by_symbol = {symbol: self._raw_samples(symbol) for symbol in SYMBOLS}
+        available_dates = sorted({
+            parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat()
+            for samples in samples_by_symbol.values()
+            for sample in samples
+        })
+        trading_date = available_dates[-1] if available_dates else None
+
+        # home_series 集合的生产口径：只取最近交易日，并以 1 分钟桶最后一个样本为准。
+        # 不能从 168 小时 raw retention 直接截最后 240 个 5 分钟桶，否则会跨交易日。
+        by_symbol: dict[str, list[dict[str, Any]]] = {}
+        if trading_date:
+            for symbol, samples in samples_by_symbol.items():
+                buckets: dict[str, dict[str, Any]] = {}
+                for sample in samples:
+                    sample_date = parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat()
+                    if sample_date != trading_date:
+                        continue
+                    bucket = bucket_start_iso(str(sample["collected_at"]), 60)
+                    buckets[bucket] = sample
+                points = []
+                for bucket, sample in sorted(buckets.items(), key=lambda item: parse_iso(item[0]).timestamp()):
+                    price = _number(sample.get("price"))
+                    if price is None or price <= 0:
+                        continue
+                    points.append({
+                        "time": bucket,
+                        "date": trading_date,
+                        "price": _round4(price),
+                        "nav": _round4(sample.get("iopv")),
+                        "premiumPercent": _round4(sample.get("computed_premium_percent")),
+                    })
+                by_symbol[symbol] = points
+        else:
+            by_symbol = {symbol: [] for symbol in SYMBOLS}
+
         group_for = {code: group["key"] for group in GROUPS[1:] for code in group["codes"]}
         price_series = []
         premium_series = []
         for symbol in SYMBOLS:
-            rows = by_symbol[symbol]
+            rows = by_symbol.get(symbol) or []
+            if not rows:
+                continue
             name = (latest.get(symbol) or {}).get("name") or symbol
             group_key = group_for.get(symbol, "all")
-            price_series.append({"key": symbol, "code": symbol, "name": name, "groupKey": group_key, "points": [{"time": row["time"], "price": row["c"]} for row in rows]})
-            premium_series.append({"key": symbol, "code": symbol, "name": name, "groupKey": group_key, "points": [{"time": row["time"], "price": row["c"], "nav": row["nav"], "premiumPercent": row["premiumPercent"], "navDate": row["date"]} for row in rows]})
+            price_series.append({
+                "key": symbol, "code": symbol, "name": name, "groupKey": group_key,
+                "points": [{"time": row["time"], "price": row["price"]} for row in rows],
+            })
+            premium_points = [{
+                "time": row["time"], "price": row["price"], "nav": row["nav"],
+                "premiumPercent": row["premiumPercent"], "navDate": trading_date,
+            } for row in rows if row["premiumPercent"] is not None]
+            if premium_points:
+                premium_series.append({
+                    "key": symbol, "code": symbol, "name": name, "groupKey": group_key,
+                    "points": premium_points,
+                })
 
         def aggregate_points(group: dict[str, Any], metric: str) -> list[dict[str, Any]]:
             values: dict[str, list[float]] = defaultdict(list)
             bases: dict[str, float] = {}
             for code in group["codes"]:
-                for row in by_symbol[code]:
-                    value = _number(row["c"] if metric == "price" else row["premiumPercent"])
+                for row in by_symbol.get(code) or []:
+                    value = _number(row["price"] if metric == "price" else row["premiumPercent"])
                     if value is None:
                         continue
                     if metric == "price":
                         bases.setdefault(code, value)
                         value = value / bases[code] * 100
                     values[row["time"]].append(value)
-            return [{"time": key, "value": _round4(statistics.mean(items) if metric == "price" else statistics.median(items))} for key, items in sorted(values.items())]
+            return [
+                {"time": key, "value": _round4(statistics.mean(items) if metric == "price" else statistics.median(items))}
+                for key, items in sorted(values.items()) if items
+            ]
 
-        price_aggregates = [{"key": f"price-equal-weight-{group['key']}", "role": "equal_weight", "label": group["label"] + "等权", "groupKey": group["key"], "normalized": True, "points": aggregate_points(group, "price")} for group in GROUPS]
-        premium_aggregates = [{"key": f"premium-median-{group['key']}", "role": "median", "label": group["label"] + "中位数", "groupKey": group["key"], "points": aggregate_points(group, "premium")} for group in GROUPS]
+        price_aggregates = [{
+            "key": f"price-equal-weight-{group['key']}", "role": "equal_weight",
+            "label": group["label"] + "等权", "groupKey": group["key"],
+            "normalized": True, "points": aggregate_points(group, "price"),
+        } for group in GROUPS]
+        premium_aggregates = [{
+            "key": f"premium-median-{group['key']}", "role": "median",
+            "label": group["label"] + "中位数", "groupKey": group["key"],
+            "points": aggregate_points(group, "premium"),
+        } for group in GROUPS]
+
+        yesterday = None
+        if len(available_dates) > 1:
+            previous_date = available_dates[-2]
+            previous_values = []
+            for samples in samples_by_symbol.values():
+                matching = [sample for sample in samples if parse_iso(str(sample["collected_at"])).astimezone(SHANGHAI).date().isoformat() == previous_date]
+                if not matching:
+                    continue
+                value = _number(matching[-1].get("computed_premium_percent"))
+                if value is not None:
+                    previous_values.append(value)
+            if previous_values:
+                yesterday = {
+                    "premiumMedianPercent": _round4(statistics.median(previous_values)),
+                    "tradingDate": previous_date,
+                }
+
         return {
-            "schemaVersion": 1, "bucketMinutes": 5, "windowLabel": "今日 · 5 分钟", "defaultGroupKey": "all",
+            "schemaVersion": 1, "tradingDate": trading_date,
+            "bucketMinutes": 1, "windowLabel": "今日 · 1 分钟", "defaultGroupKey": "all",
             "generatedAt": _shanghai_iso(datetime.now(timezone.utc)),
             "groups": [{key: value for key, value in group.items() if key != "codes"} for group in GROUPS],
+            "yesterday": yesterday,
             "modes": {
                 "price": {"aggregate": {"series": price_aggregates}, "series": price_series},
                 "premium": {"aggregate": {"series": premium_aggregates}, "series": premium_series},
             },
+            "source": f"market-collector-{self.store.backend_name}-1m",
         }
 
     def market_summary(self, region: str) -> dict[str, Any] | None:
@@ -496,6 +591,171 @@ class MarketDataService:
         normalized = str(region or "CN").strip().upper()
         cache_key = "market-summary:" + normalized
         return self.cache.get_or_load(cache_key, 60, lambda: fetch_market_summary(normalized, self.timeout_sec))
+
+    def indices(self, market: str) -> dict[str, Any] | None:
+        """指数行情，直连东财/腾讯/新浪（indices.py），60 秒缓存。"""
+        from .indices import fetch_market_summary
+
+        normalized = str(market or "cn").strip().lower()
+        if normalized not in {"cn", "us"}:
+            return None
+        summary = self.cache.get_or_load(
+            "indices:" + normalized, 60,
+            lambda: fetch_market_summary("CN" if normalized == "cn" else "US", self.timeout_sec),
+        )
+        if not summary or not summary.get("items"):
+            return None
+        return {
+            "market": normalized,
+            "generatedAt": str(summary.get("generatedAt") or _shanghai_iso(datetime.now(timezone.utc))),
+            "indexes": summary.get("items") or [],
+        }
+
+    def web_market_summary(self, region: str) -> dict[str, Any] | None:
+        """/market-summary 的本地同构响应（前端行情条 US/CN，直连东财/腾讯/新浪）。"""
+        from .indices import fetch_market_summary
+
+        normalized = str(region or "US").strip().upper()
+        if normalized not in {"CN", "US"}:
+            return None
+        summary = self.cache.get_or_load(
+            "market-summary-web:" + normalized, 60,
+            lambda: fetch_market_summary(normalized, self.timeout_sec),
+        )
+        if not summary or not summary.get("items"):
+            return None
+        items = []
+        for item in summary.get("items") or []:
+            price = _number(item.get("current_price"))
+            change = _number(item.get("change"))
+            change_percent = _number(item.get("change_percent"))
+            items.append({
+                "symbol": str(item.get("symbol") or item.get("key") or ""),
+                "name": str(item.get("name") or ""),
+                "price": price,
+                "priceText": f"{price:,.2f}" if price is not None else "",
+                "change": change,
+                "changeText": f"{change:g}" if change is not None else "",
+                "changePercent": change_percent,
+                "changePercentText": f"{change_percent:+.2f}%" if change_percent is not None else "",
+                "marketState": "",
+                "asOf": str(item.get("datetime") or ""),
+                "timeText": "",
+                "exchangeTimezone": str(item.get("timezone") or ""),
+                "delayMinutes": 0,
+                "source": "collector-indices",
+                "summaryRegion": normalized,
+                "sparkline": None,
+            })
+        return {
+            "region": normalized,
+            "title": str(summary.get("title") or ("CN Markets" if normalized == "CN" else "US Markets")),
+            "generatedAt": str(summary.get("generatedAt") or _shanghai_iso(datetime.now(timezone.utc))),
+            "source": "collector-indices",
+            "items": items,
+        }
+
+    def _year_extremes(self, symbol: str) -> dict[str, Any]:
+        def load() -> dict[str, Any]:
+            payload = self.daily_price_klines(symbol, 280)
+            highs = [_number(candle.get("h")) for candle in payload.get("candles") or []]
+            lows = [_number(candle.get("l")) for candle in payload.get("candles") or []]
+            highs = [value for value in highs if value is not None and value > 0]
+            lows = [value for value in lows if value is not None and value > 0]
+            return {"high52w": max(highs) if highs else None, "low52w": min(lows) if lows else None}
+
+        return self.cache.get_or_load(f"year-extremes:{symbol}", 3600, load)
+
+    def xueqiu_fund_data(self, symbol: str) -> dict[str, Any] | None:
+        """场内 ETF 的 xueqiu-fund-data 本地拼装（quote_detail 部分）。
+
+        只覆盖 quote 相关字段；资金流/财务等雪球特有键不产出，
+        非池内代码或拼装失败时由路由返回 404。
+        """
+        normalized = str(symbol or "").strip()
+        if not (normalized.isdigit() and len(normalized) == 6):
+            return None
+        item = self._latest_by_symbol().get(normalized)
+        if not item or item.get("fundKind") or item.get("fundType"):
+            return None
+        price = _number(item.get("price"))
+        if price is None or price <= 0:
+            return None
+        metric: dict[str, Any] = {}
+        metrics = self.fund_metrics([normalized])
+        if metrics and isinstance(metrics[0], dict):
+            metric = metrics[0]
+        nav_date = str(metric.get("latestNavDate") or "")[:10]
+        exchange = "SH" if normalized.startswith(("5", "6")) else "SZ"
+        premium = _number(item.get("vendor_premium_percent"))
+        if premium is None:
+            premium = _number(item.get("computed_premium_percent"))
+        quote: dict[str, Any] = {
+            "symbol": exchange + normalized,
+            "code": normalized,
+            "name": str(item.get("name") or normalized),
+            "current": price,
+            "last_close": _number(item.get("previous_close")),
+            "chg": _number(item.get("change")),
+            "percent": _number(item.get("change_percent")),
+            "open": _number(item.get("open")),
+            "high": _number(item.get("high")),
+            "low": _number(item.get("low")),
+            "volume": _number(item.get("volume")),
+            "amount": _number(item.get("turnover")),
+            "iopv": _number(metric.get("iopv")),
+            "unit_nav": _number(metric.get("latestNav")),
+            "nav_date": _date_epoch(nav_date) * 1000 if nav_date else None,
+            "premium_rate": premium,
+            "current_year_percent": _number(item.get("current_year_percent")),
+            "high52w": None,
+            "low52w": None,
+            "currency": "CNY",
+            "exchange": exchange,
+            "exchangeTimezone": "Asia/Shanghai",
+            "timestamp": None,
+        }
+        try:
+            collected_at = str(item.get("collected_at") or "")
+            if collected_at:
+                quote["timestamp"] = int(parse_iso(collected_at).timestamp() * 1000)
+        except Exception:
+            pass
+        try:
+            extremes = self._year_extremes(normalized)
+            quote["high52w"] = extremes.get("high52w")
+            quote["low52w"] = extremes.get("low52w")
+        except Exception:
+            pass
+        return {
+            "cached": False,
+            "code": normalized,
+            "generatedAt": _shanghai_iso(datetime.now(timezone.utc)),
+            "results": {"quote_detail": {"ok": True, "data": {"quote": quote}}},
+        }
+
+    def fund_fees(self, symbols: list[str]) -> list[dict[str, Any]]:
+        """本地 fund_fee 快照（22:30 夜间直连东财落库），响应结构与旧 worker /fund-fee 一致。"""
+        codes = list(dict.fromkeys(
+            str(code or "").strip() for code in (symbols or [])
+            if str(code or "").strip().isdigit() and len(str(code or "").strip()) == 6
+        ))
+        refs = self.store.read_latest_fund_references("fund_fee", codes)
+        return [
+            {"code": code, "ok": True, "data": refs[code]}
+            if code in refs else
+            {"code": code, "ok": False, "error": "fund fee unavailable"}
+            for code in codes
+        ]
+
+    def fund_limit(self, symbol: str) -> dict[str, Any] | None:
+        """本地 fund_limit 限购快照，payload 与旧 worker /api/fund-limit 同构。"""
+        code = str(symbol or "").strip()
+        if not (code.isdigit() and len(code) == 6):
+            return None
+        refs = self.store.read_latest_fund_references("fund_limit", [code])
+        payload = refs.get(code)
+        return payload if isinstance(payload, dict) else None
 
     def fund_limit_overview(self) -> dict[str, Any]:
         import statistics as _stats

@@ -1,18 +1,22 @@
+"""基金参考数据同步（直连东财版，不再回源 CF workers）。
+
+- fund_fee：东财 F10 费率页（管理费/托管费/销售服务费 + 申赎状态文案）；
+- fund_limit：东财移动端 FundMNBasicInformation（SGZT 申购状态、MINSG/MAXSG 限额），
+  辅以 F10 的申赎状态文案做交叉校验。
+
+夜间同步后写入 fund_reference_snapshots（source 前缀 direct:*），
+API 的 /fund-fee、/fund-limit 从本地快照读取。
+"""
 from __future__ import annotations
 
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any, Callable
-from urllib.error import HTTPError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
-DEFAULT_WORKER_URL = "https://api.freebacktrack.tech"
-FEE_BATCH_SIZE = 24
+from .eastmoney_fund import build_limit_payload, fetch_f10_fees, fetch_fund_info
 
+SHANGHAI = ZoneInfo("Asia/Shanghai")
 LIMIT_SCHEMA_VERSION = 2
 
 
@@ -25,7 +29,7 @@ def _positive_number(value: Any) -> float | None:
 
 
 def normalize_limit_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """把 Worker 的双渠道限额规范化为 collector 的正式 payload。"""
+    """把直连限额数据规范化为 collector 的正式 payload（与旧 worker 版同构）。"""
     data = dict(payload or {})
     raw_limits = data.get("channelLimits")
     limits: dict[str, float] = {}
@@ -47,11 +51,10 @@ def normalize_limit_payload(payload: dict[str, Any]) -> dict[str, Any]:
             data["limitChannel"] = "app"
         elif limits.get("distributor") is not None:
             data["limitChannel"] = "channel"
+        else:
+            data["limitChannel"] = data.get("limitChannel") or "channel"
     data["limitSchemaVersion"] = LIMIT_SCHEMA_VERSION
     return data
-
-
-JsonRequest = Callable[[str, str, dict[str, Any] | None, float], dict[str, Any]]
 
 
 def normalize_fund_code(value: Any) -> str:
@@ -60,28 +63,8 @@ def normalize_fund_code(value: Any) -> str:
     return digits[-6:] if len(digits) >= 6 else ""
 
 
-def request_json(
-    method: str,
-    url: str,
-    payload: dict[str, Any] | None,
-    timeout_sec: float,
-) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
-    request = Request(
-        url,
-        data=body,
-        method=method,
-        headers={
-            "accept": "application/json",
-            "content-type": "application/json",
-            "user-agent": "market-collector-fund-reference/1",
-        },
-    )
-    with urlopen(request, timeout=timeout_sec) as response:
-        decoded = json.loads(response.read().decode("utf-8", "replace"))
-    if not isinstance(decoded, dict):
-        raise ValueError("Worker response must be a JSON object")
-    return decoded
+FetchFees = Callable[[str, float], dict[str, Any] | None]
+FetchInfo = Callable[[str, float], dict[str, Any] | None]
 
 
 def _snapshot_record(
@@ -98,108 +81,87 @@ def _snapshot_record(
         "symbol": code,
         "snapshot_date": snapshot_date,
         "fetched_at": fetched_at,
-        "source": "worker:" + data_kind.replace("_", "-"),
+        "source": "direct:" + data_kind.replace("_", "-"),
         "payload": normalized_payload,
     }
 
 
-def _fetch_fee_records(
-    codes: list[str],
-    worker_url: str,
+def _build_fee_payload(
+    code: str,
+    fee_data: dict[str, Any],
+    fund_name: str | None,
+    fetched_at: str,
+) -> dict[str, Any]:
+    return {
+        "annualFeeRate": fee_data.get("annualFeeRate"),
+        "code": code,
+        "custodyFeeRate": fee_data.get("custodyFeeRate"),
+        "fetchedAt": fetched_at,
+        "fundName": fund_name,
+        "managementFeeRate": fee_data.get("managementFeeRate"),
+        "operationFeeRate": fee_data.get("operationFeeRate"),
+        "operationFees": fee_data.get("operationFees") or [],
+        "purchaseRules": fee_data.get("purchaseRules") or [],
+        "redeemRules": fee_data.get("redeemRules") or [],
+        "salesServiceFeeRate": fee_data.get("salesServiceFeeRate"),
+        "source": "eastmoney-f10",
+    }
+
+
+def _fetch_code_records(
+    code: str,
     timeout_sec: float,
-    client: JsonRequest,
     fetched_at: str,
     snapshot_date: str,
+    want_fee: bool,
+    want_limit: bool,
+    fetch_fees: FetchFees,
+    fetch_info: FetchInfo,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     records: list[dict[str, Any]] = []
     errors: list[str] = []
-    endpoint = worker_url.rstrip("/") + "/api/fund-fee"
-    for start in range(0, len(codes), FEE_BATCH_SIZE):
-        batch = codes[start:start + FEE_BATCH_SIZE]
-        try:
-            response = client("POST", endpoint, {"codes": batch}, timeout_sec)
-        except Exception as exc:
-            errors.append(f"fund_fee:{','.join(batch)}: {exc}")
-            continue
-        items = response.get("items")
-        if not isinstance(items, list):
-            errors.append(f"fund_fee:{','.join(batch)}: invalid items")
-            continue
-        returned: set[str] = set()
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            code = normalize_fund_code(item.get("code") or (item.get("data") or {}).get("code"))
-            data = item.get("data")
-            if code not in batch or item.get("ok") is not True or not isinstance(data, dict):
-                if code in batch:
-                    errors.append(f"fund_fee:{code}: {item.get('error') or 'no data'}")
-                continue
-            returned.add(code)
-            records.append(_snapshot_record("fund_fee", code, data, fetched_at, snapshot_date))
-        for code in batch:
-            if code not in returned and not any(error.startswith(f"fund_fee:{code}:") for error in errors):
-                errors.append(f"fund_fee:{code}: missing response")
+    fee_data: dict[str, Any] | None = None
+    info: dict[str, Any] | None = None
+    if want_fee:
+        fee_data = fetch_fees(code, timeout_sec)
+        if not isinstance(fee_data, dict):
+            errors.append(f"fund_fee:{code}: eastmoney f10 unavailable")
+    if want_limit:
+        info = fetch_info(code, timeout_sec)
+        if not isinstance(info, dict):
+            errors.append(f"fund_limit:{code}: eastmoney fund info unavailable")
+    fund_name = str((info or {}).get("fundName") or "") or None
+    if want_fee:
+        if isinstance(fee_data, dict):
+            records.append(_snapshot_record(
+                "fund_fee", code,
+                _build_fee_payload(code, fee_data, fund_name, fetched_at),
+                fetched_at, snapshot_date,
+            ))
+    if want_limit:
+        limit_payload = build_limit_payload(info, fee_data)
+        if limit_payload is not None:
+            normalized = normalize_limit_payload(limit_payload)
+            if fund_name:
+                normalized["fundName"] = fund_name
+            records.append(_snapshot_record(
+                "fund_limit", code, normalized, fetched_at, snapshot_date,
+            ))
+        elif not any(error.startswith(f"fund_limit:{code}:") for error in errors):
+            errors.append(f"fund_limit:{code}: no purchase status from eastmoney")
     return records, errors
-
-
-def _fetch_one_limit(
-    code: str,
-    worker_url: str,
-    timeout_sec: float,
-    client: JsonRequest,
-) -> tuple[str, dict[str, Any] | None, str | None]:
-    endpoint = worker_url.rstrip("/") + "/api/fund-limit?" + urlencode({"code": code})
-    try:
-        payload = client("GET", endpoint, None, timeout_sec)
-    except HTTPError as exc:
-        return code, None, f"HTTP {exc.code}"
-    except Exception as exc:
-        return code, None, str(exc)
-    response_code = normalize_fund_code(payload.get("code") or code)
-    if response_code != code:
-        return code, None, "response code mismatch"
-    return code, normalize_limit_payload(payload), None
-
-
-def _fetch_limit_records(
-    codes: list[str],
-    worker_url: str,
-    timeout_sec: float,
-    concurrency: int,
-    client: JsonRequest,
-    fetched_at: str,
-    snapshot_date: str,
-) -> tuple[list[dict[str, Any]], list[str]]:
-    records_by_code: dict[str, dict[str, Any]] = {}
-    errors: list[str] = []
-    worker_count = max(1, min(int(concurrency), 8, len(codes))) if codes else 1
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        futures = {
-            executor.submit(_fetch_one_limit, code, worker_url, timeout_sec, client): code
-            for code in codes
-        }
-        for future in as_completed(futures):
-            code, payload, error = future.result()
-            if error is not None or payload is None:
-                errors.append(f"fund_limit:{code}: {error or 'no data'}")
-                continue
-            records_by_code[code] = _snapshot_record(
-                "fund_limit", code, payload, fetched_at, snapshot_date
-            )
-    return [records_by_code[code] for code in codes if code in records_by_code], errors
 
 
 def fetch_fund_references(
     symbols: list[str],
     *,
-    worker_url: str = DEFAULT_WORKER_URL,
     timeout_sec: float = 25.0,
     concurrency: int = 4,
-    client: JsonRequest = request_json,
     now: datetime | None = None,
     fee_symbols: list[str] | None = None,
     limit_symbols: list[str] | None = None,
+    fetch_fees: FetchFees = fetch_f10_fees,
+    fetch_info: FetchInfo = fetch_fund_info,
 ) -> dict[str, Any]:
     current = (now or datetime.now(timezone.utc)).astimezone(SHANGHAI)
     fetched_at = current.replace(microsecond=0).isoformat()
@@ -212,14 +174,32 @@ def fetch_fund_references(
     limit_codes = list(dict.fromkeys(
         code for code in (normalize_fund_code(symbol) for symbol in (limit_symbols or symbols)) if code
     ))
-    fee_records, fee_errors = _fetch_fee_records(
-        fee_codes, worker_url, timeout_sec, client, fetched_at, snapshot_date
-    )
-    limit_records, limit_errors = _fetch_limit_records(
-        limit_codes, worker_url, timeout_sec, concurrency, client, fetched_at, snapshot_date
-    )
-    records = fee_records + limit_records
+    fee_set = set(fee_codes)
+    limit_set = set(limit_codes)
     all_codes = list(dict.fromkeys(fee_codes + limit_codes))
+    records: list[dict[str, Any]] = []
+    errors: list[str] = []
+    if all_codes:
+        workers = max(1, min(int(concurrency), 8, len(all_codes)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    _fetch_code_records, code, timeout_sec, fetched_at, snapshot_date,
+                    code in fee_set, code in limit_set, fetch_fees, fetch_info,
+                ): code
+                for code in all_codes
+            }
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    code_records, code_errors = future.result()
+                except Exception as exc:
+                    errors.append(f"{code}: {exc}")
+                    continue
+                records.extend(code_records)
+                errors.extend(code_errors)
+    fee_records = [record for record in records if record["data_kind"] == "fund_fee"]
+    limit_records = [record for record in records if record["data_kind"] == "fund_limit"]
     return {
         "kind": "market-collector-fund-reference-sync",
         "generated_at": fetched_at,
@@ -230,15 +210,5 @@ def fetch_fund_references(
         "limit_success_count": len(limit_records),
         "limit_failure_count": len(limit_codes) - len(limit_records),
         "records": records,
-        "errors": fee_errors + limit_errors,
+        "errors": errors,
     }
-
-
-def fetch_fund_limit_overview(
-    worker_url: str = DEFAULT_WORKER_URL,
-    timeout_sec: float = 25.0,
-    client: JsonRequest = request_json,
-) -> dict[str, Any]:
-    """拉取场外限额聚合快照（ocr-proxy /api/fund-limit/overview，含 quotaGroups/events/trend）。"""
-    endpoint = worker_url.rstrip("/") + "/api/fund-limit/overview?days=30"
-    return client("GET", endpoint, None, timeout_sec)

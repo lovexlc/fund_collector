@@ -48,15 +48,17 @@ _SINA_RE = re.compile(r'hq_str_[^=]+="([^"]*)";?')
 
 
 def _fetch(url: str, timeout: float) -> bytes:
-    request = urllib.request.Request(
+    # 经 netutil：东财被 WAF 拦截时走出口代理；腾讯/新浪直连失败直接抛错。
+    from .netutil import fetch_url
+
+    return fetch_url(
         url,
+        timeout,
         headers={
             "user-agent": "Mozilla/5.0",
             "referer": "https://quote.eastmoney.com/",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read()
 
 
 def _try_eastmoney(secid: str, timeout: float) -> dict[str, Any] | None:

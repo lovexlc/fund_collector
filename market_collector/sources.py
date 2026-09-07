@@ -69,15 +69,17 @@ def eastmoney_secid(symbol: str) -> str:
 
 
 def default_fetch_bytes(url: str, timeout_sec: float) -> bytes:
-    request = urllib.request.Request(
+    # 经 netutil：东财直连被 WAF 拦截时走机器级出口代理重试（腾讯/新浪保持直连）。
+    from .netutil import fetch_url
+
+    return fetch_url(
         url,
+        timeout_sec,
         headers={
             "user-agent": "Mozilla/5.0",
             "referer": "https://quote.eastmoney.com/",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-        return response.read()
 
 
 def decode_tencent_payload(raw: bytes) -> str:

@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from market_collector.aggregates import MarketDataService
@@ -74,26 +75,26 @@ class AggregateServiceTest(unittest.TestCase):
         }), encoding="utf-8")
 
         def fetch_json(url: str, _timeout: float) -> dict:
-            if "/markets/kline/" in url:
-                return {"name": "纳指ETF国泰", "candles": [
-                    {"t": 1786291200, "o": 2.00, "c": 2.10, "h": 2.12, "l": 1.98, "v": 1000},
-                    {"t": 1786377600, "o": 2.10, "c": 2.12, "h": 2.15, "l": 2.08, "v": 1100},
-                ]}
             if "push2his" in url:
                 return {"data": {"name": "纳指ETF国泰", "klines": [
                     "2026-08-10,2.00,2.10,2.12,1.98,1000,2100,7.00,5.00,0.10,2.00",
                     "2026-08-11,2.10,2.12,2.15,2.08,1100,2300,3.33,0.95,0.02,2.10",
                 ]}}
-            return {"items": [
-                {"date": "2026-08-07", "nav": 2.0},
-                {"date": "2026-08-10", "nav": 2.02},
-            ], "generatedAt": "2026-08-11T09:40:00+08:00"}
+            raise ValueError(f"unexpected fetch: {url}")
 
         def post_json(_url: str, _payload: dict, _timeout: float) -> dict:
-            return {"items": [{"code": "513100", "data": {"items": [
+            raise AssertionError("post_json must not be used in local-only mode")
+
+        # NAV 直连蛋卷：补丁模块级函数，本地 nav_daily 为空时由它补全。
+        self._danjuan_patch = patch(
+            "market_collector.aggregates.fetch_danjuan_nav_history",
+            lambda code, size=90, timeout=12.0: [
                 {"date": "2026-08-07", "nav": 2.0},
                 {"date": "2026-08-10", "nav": 2.02},
-            ]}}]}
+            ],
+        )
+        self._danjuan_patch.start()
+        self.addCleanup(self._danjuan_patch.stop)
 
         self.service = MarketDataService(
             self.store, self.data_dir, fetch_json=fetch_json, post_json=post_json,

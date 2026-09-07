@@ -7,9 +7,7 @@ from pathlib import Path
 
 from market_collector.http_server import (
     _is_web_api_route,
-    _merge_fresh_record,
     _normalize_sec_financials,
-    _upstream_target,
     resolve_request,
 )
 
@@ -17,7 +15,14 @@ from market_collector.http_server import (
 class FakeMarketDataService:
     def quote(self, symbol: str):
         if symbol == "513100":
-            return {"symbol": symbol, "price": 2.2, "asOf": "2026-08-11T10:00:00+08:00"}
+            return {
+                "symbol": symbol,
+                "price": 2.2,
+                "asOf": "2026-08-11T10:00:00+08:00",
+                "return1m": 2.3,
+                "currentYearPercent": 11.78,
+                "highPoint": {"price": 2.087, "highDate": "2026-06-02"},
+            }
         return None
 
     def fund_metric(self, symbol: str):
@@ -29,6 +34,7 @@ class FakeMarketDataService:
                 "code": code,
                 "price": 2.2,
                 "source": "local",
+                "return1m": 2.3,
                 "updatedAt": "2026-08-11T10:00:00+08:00",
             }
             for code in symbols if code == "513100"
@@ -40,6 +46,34 @@ class FakeMarketDataService:
             "interval": interval,
             "candles": [{"c": 2.2}] * min(limit, 2),
         }
+
+    def fund_fees(self, symbols: list[str]):
+        return [
+            {"code": code, "ok": True, "data": {"managementFeeRate": 0.8}}
+            if code == "513100" else
+            {"code": code, "ok": False, "error": "fund fee unavailable"}
+            for code in symbols
+        ]
+
+    def fund_limit(self, symbol: str):
+        if symbol != "513100":
+            return None
+        return {"code": symbol, "buyStatus": "open", "maxPurchasePerDay": 1000.0}
+
+    def indices(self, market: str):
+        if market not in {"cn", "us"}:
+            return None
+        return {"market": market, "indexes": [{"symbol": "SPX", "price": 5000.0}]}
+
+    def web_market_summary(self, region: str):
+        if region not in {"CN", "US"}:
+            return None
+        return {"region": region, "items": [{"symbol": "SPX", "price": 5000.0}]}
+
+    def xueqiu_fund_data(self, symbol: str):
+        if symbol != "513100":
+            return None
+        return {"code": symbol, "results": {"quote_detail": {"ok": True}}}
 
 
 class HttpServerTest(unittest.TestCase):
@@ -98,36 +132,124 @@ class HttpServerTest(unittest.TestCase):
         self.assertFalse(_is_web_api_route("/ask"))
         self.assertFalse(_is_web_api_route("/kline-batch"))
 
-    def test_fund_fee_uses_top_level_api_route(self) -> None:
-        self.assertEqual(
-            _upstream_target("/fund-fee"),
-            "https://api.freebacktrack.tech/api/fund-fee",
+    def test_quote_serves_local_record_with_summary_metrics(self) -> None:
+        status, payload = resolve_request(
+            "/quote/513100",
+            self.data_dir,
+            FakeMarketDataService(),
         )
-        self.assertEqual(
-            _upstream_target("/news"),
-            "https://api.freebacktrack.tech/api/markets/news",
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["price"], 2.2)
+        self.assertEqual(payload["return1m"], 2.3)
+        self.assertEqual(payload["currentYearPercent"], 11.78)
+        self.assertEqual(payload["highPoint"]["price"], 2.087)
+        self.assertEqual(payload["market"], "cn")
+        self.assertEqual(payload["source"], "market-collector")
+
+    def test_quote_missing_symbol_is_404_without_upstream(self) -> None:
+        status, payload = resolve_request(
+            "/quote/QQQ",
+            self.data_dir,
+            FakeMarketDataService(),
         )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "symbol_not_found")
 
-    def test_post_fund_fee_is_forwarded_by_compatibility_route(self) -> None:
-        calls = []
+    def test_quotes_serve_local_only(self) -> None:
+        status, payload = resolve_request(
+            "/api/markets/quotes?symbols=513100,QQQ",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["source"], "market-collector")
+        self.assertIn("513100", payload["quotes"])
+        # 本地没有的代码直接缺席，不再回源 workers。
+        self.assertNotIn("QQQ", payload["quotes"])
+        self.assertEqual(payload["quotes"]["513100"]["price"], 2.2)
+        self.assertEqual(payload["quotes"]["513100"]["return1m"], 2.3)
 
-        def proxy(method, path, body):
-            calls.append((method, path, body))
-            return 200, {"items": [{"code": "000834", "purchaseFeeRate": 0.12}]}
+    def test_quotes_missing_symbols_is_404(self) -> None:
+        status, payload = resolve_request(
+            "/quotes?symbols=QQQ,SPY",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "symbols_not_found")
 
+    def test_post_fund_metrics_serves_local_only(self) -> None:
+        status, payload = resolve_request(
+            "/fund-metrics",
+            self.data_dir,
+            FakeMarketDataService(),
+            method="POST",
+            body={"codes": ["513100", "000834"]},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["successCount"], 1)
+        self.assertEqual(payload["failureCount"], 1)
+        self.assertEqual(payload["items"][0]["code"], "513100")
+        self.assertEqual(payload["items"][0]["return1m"], 2.3)
+
+    def test_fund_fee_serves_local_snapshots(self) -> None:
         status, payload = resolve_request(
             "/api/market-collector/fund-fee?refresh=1",
             self.data_dir,
             FakeMarketDataService(),
             method="POST",
-            body={"codes": ["000834"]},
-            proxy_request=proxy,
+            body={"codes": ["513100", "000834"]},
         )
         self.assertEqual(status, 200)
-        self.assertEqual(payload["items"][0]["code"], "000834")
-        self.assertEqual(calls, [
-            ("POST", "/fund-fee?refresh=1", {"codes": ["000834"]}),
-        ])
+        self.assertEqual(payload["source"], "market-collector-local")
+        self.assertEqual(payload["successCount"], 1)
+        self.assertEqual(payload["failureCount"], 1)
+        self.assertEqual(payload["items"][0]["code"], "513100")
+        self.assertTrue(payload["items"][0]["ok"])
+        self.assertFalse(payload["items"][1]["ok"])
+
+    def test_fund_limit_serves_local_snapshot(self) -> None:
+        status, payload = resolve_request(
+            "/fund-limit?code=513100",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["buyStatus"], "open")
+        self.assertEqual(payload["maxPurchasePerDay"], 1000.0)
+
+        status, payload = resolve_request(
+            "/fund-limit?code=000834",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "fund_limit_unavailable")
+
+    def test_indices_and_market_summary_serve_local(self) -> None:
+        status, payload = resolve_request(
+            "/indices?market=cn",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["market"], "cn")
+
+        status, payload = resolve_request(
+            "/market-summary?region=US",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["region"], "US")
+
+        status, payload = resolve_request(
+            "/market-summary?region=EU",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "market_summary_unavailable")
 
     def test_sec_company_facts_are_normalized_for_financial_panel(self) -> None:
         payload = _normalize_sec_financials({
@@ -159,23 +281,19 @@ class HttpServerTest(unittest.TestCase):
         self.assertEqual(payload["statements"]["income"]["quarterly"][0]["fields"]["totalRevenue"], 30)
         self.assertEqual(payload["statements"]["balance"]["quarterly"][0]["fields"]["totalAssets"], 520)
 
-    def test_financials_uses_sec_source_without_proxy(self) -> None:
+    def test_financials_uses_sec_source_directly(self) -> None:
         expected = {"symbol": "AAPL", "source": "sec-companyfacts", "statements": {}}
-
-        def no_proxy(*_args):
-            self.fail("working SEC financials source should not call compatibility proxy")
 
         status, payload = resolve_request(
             "/financials/AAPL?refresh=1",
             self.data_dir,
             FakeMarketDataService(),
-            proxy_request=no_proxy,
             financials_request=lambda symbol, force: expected,
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload, expected)
 
-    def test_financials_falls_back_to_proxy_when_sec_is_unavailable(self) -> None:
+    def test_financials_sec_failure_returns_bad_gateway(self) -> None:
         def unavailable(*_args):
             raise OSError("SEC unavailable")
 
@@ -183,138 +301,39 @@ class HttpServerTest(unittest.TestCase):
             "/financials/AAPL",
             self.data_dir,
             FakeMarketDataService(),
-            proxy_request=lambda *_args: (503, {"error": "upstream_unavailable"}),
             financials_request=unavailable,
         )
-        self.assertEqual(status, 503)
-        self.assertEqual(payload["error"], "upstream_unavailable")
+        self.assertEqual(status, 502)
+        self.assertEqual(payload["error"], "financials_unavailable")
 
-    def test_quotes_merge_local_freshness_with_upstream_metadata(self) -> None:
-        calls = []
-
-        def proxy(method, path, body):
-            calls.append((method, path, body))
-            return 200, {"quotes": {
-                "513100": {
-                    "symbol": "513100",
-                    "price": 2.0,
-                    "asOf": "2026-08-11T09:00:00+08:00",
-                    "highPoint": {"price": 2.8},
-                },
-                "QQQ": {"symbol": "QQQ", "price": 600},
-            }}
-
-        status, payload = resolve_request(
-            "/api/markets/quotes?symbols=513100,QQQ",
-            self.data_dir,
-            FakeMarketDataService(),
-            proxy_request=proxy,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["quotes"]["513100"]["price"], 2.2)
-        self.assertEqual(payload["quotes"]["513100"]["highPoint"]["price"], 2.8)
-        self.assertEqual(payload["quotes"]["QQQ"]["price"], 600)
-        self.assertEqual(len(calls), 1)
-
-    def test_quotes_degrade_to_local_without_upstream(self) -> None:
-        status, payload = resolve_request(
-            "/quotes?symbols=513100",
-            self.data_dir,
-            FakeMarketDataService(),
-            proxy_request=lambda *_args: (502, {"error": "offline"}),
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["quotes"]["513100"]["source"], "market-collector")
-
-    def test_post_fund_metrics_merges_local_and_upstream(self) -> None:
-        def proxy(method, path, body):
-            self.assertEqual(method, "POST")
-            self.assertEqual(body["codes"], ["513100", "000834"])
-            return 200, {"items": [
-                {
-                    "code": "513100",
-                    "price": 2.0,
-                    "asOf": "2026-08-11T09:00:00+08:00",
-                    "highPoint": {"price": 2.8},
-                },
-                {"code": "000834", "latestNav": 6.2},
-            ]}
-
-        status, payload = resolve_request(
-            "/fund-metrics",
-            self.data_dir,
-            FakeMarketDataService(),
-            method="POST",
-            body={"codes": ["513100", "000834"]},
-            proxy_request=proxy,
-        )
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["successCount"], 2)
-        self.assertEqual(payload["items"][0]["price"], 2.2)
-        self.assertEqual(payload["items"][0]["highPoint"]["price"], 2.8)
-        self.assertEqual(payload["items"][1]["latestNav"], 6.2)
-
-    def test_newer_upstream_record_is_not_overwritten_by_stale_local_data(self) -> None:
-        merged = _merge_fresh_record(
-            {"price": 2.4, "asOf": "2026-08-11T11:00:00+08:00", "source": "upstream"},
-            {"price": 2.2, "asOf": "2026-08-11T10:00:00+08:00", "source": "local"},
-        )
-        self.assertEqual(merged["price"], 2.4)
-        self.assertEqual(merged["source"], "upstream")
-
-    def test_fresher_upstream_record_keeps_local_summary_metrics(self) -> None:
-        merged = _merge_fresh_record(
-            {
-                "price": 2.4,
-                "asOf": "2026-08-11T11:00:00+08:00",
-                "return1m": 2.3001,
-                "source": "upstream",
-            },
-            {
-                "price": 2.2,
-                "asOf": "2026-08-11T10:00:00+08:00",
-                "return1m": 2.3,
-                "currentYearPercent": 11.78,
-                "highPoint": {"price": 2.087, "highDate": "2026-06-02"},
-                "source": "local",
-            },
-        )
-        self.assertEqual(merged["price"], 2.4)
-        self.assertEqual(merged["source"], "upstream")
-        self.assertEqual(merged["return1m"], 2.3)
-        self.assertEqual(merged["currentYearPercent"], 11.78)
-        self.assertEqual(merged["highPoint"]["price"], 2.087)
-
-    def test_invalid_local_timestamp_does_not_replace_timed_upstream_record(self) -> None:
-        merged = _merge_fresh_record(
-            {"price": 2.4, "asOf": "2026-08-11T11:00:00+08:00"},
-            {"price": 2.2, "asOf": "invalid"},
-        )
-        self.assertEqual(merged["price"], 2.4)
-
-    def test_local_kline_alias_avoids_proxy(self) -> None:
-        def no_proxy(*_args):
-            self.fail("local 1d kline should not call upstream proxy")
-
+    def test_local_kline_served_without_upstream(self) -> None:
         status, payload = resolve_request(
             "/api/market-collector/kline/513100?tf=1d&limit=2",
             self.data_dir,
             FakeMarketDataService(),
-            proxy_request=no_proxy,
         )
         self.assertEqual(status, 200)
         self.assertEqual(payload["interval"], "1d")
         self.assertEqual(len(payload["candles"]), 2)
 
-    def test_unimplemented_web_route_preserves_proxy_status(self) -> None:
+    def test_kline_missing_local_symbol_is_404(self) -> None:
+        status, payload = resolve_request(
+            "/kline/QQQ?tf=1d",
+            self.data_dir,
+            FakeMarketDataService(),
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "kline_not_found")
+
+    def test_unimplemented_web_route_returns_local_unavailable(self) -> None:
+        # worker 专属功能（news/sectors/movers/...）明确本地不可用，绝不回源。
         status, payload = resolve_request(
             "/news?market=us",
             self.data_dir,
             FakeMarketDataService(),
-            proxy_request=lambda method, path, body: (503, {"error": "cache_miss"}),
         )
-        self.assertEqual(status, 503)
-        self.assertEqual(payload["error"], "cache_miss")
+        self.assertEqual(status, 404)
+        self.assertEqual(payload["error"], "local_data_unavailable")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from market_collector.core import DEFAULT_CONFIG, MarketCollector, deep_update, due_daily_slot
-from market_collector.fund_reference import FEE_BATCH_SIZE, fetch_fund_references, normalize_limit_payload
+from market_collector.fund_reference import fetch_fund_references, normalize_limit_payload
 
 
 class FakeStore:
@@ -35,36 +35,73 @@ class FundReferenceTest(unittest.TestCase):
         self.assertEqual(payload["limitChannel"], "app")
         self.assertEqual(payload["limitSchemaVersion"], 2)
 
-    def test_fetches_fee_batches_and_cache_only_limits(self) -> None:
-        codes = [f"{index:06d}" for index in range(FEE_BATCH_SIZE + 1)]
-        calls: list[tuple[str, str, dict | None]] = []
+    def test_fetches_fee_and_limit_from_direct_sources(self) -> None:
+        def fetch_fees(code, _timeout):
+            return {
+                "code": code,
+                "managementFeeRate": 0.8,
+                "custodyFeeRate": 0.2,
+                "salesServiceFeeRate": 0.0,
+                "annualFeeRate": 1.0,
+                "operationFeeRate": 0.8,
+                "operationFees": [["管理费率", "0.80%（每年）"]],
+                "purchaseRules": [],
+                "redeemRules": [["申购状态", "开放申购", "赎回状态", "开放赎回", "定投状态", "支持"]],
+                "purchaseStatusText": "开放申购",
+                "source": "eastmoney-f10",
+            }
 
-        def client(method, url, payload, _timeout):
-            calls.append((method, url, payload))
-            if url.endswith("/api/fund-fee"):
-                return {
-                    "items": [
-                        {"code": code, "ok": True, "data": {"code": code, "buyRules": []}}
-                        for code in payload["codes"]
-                    ]
-                }
-            code = url.rsplit("=", 1)[-1]
-            return {"code": code, "maxPurchasePerDay": 1000, "source": "f10_html"}
+        def fetch_info(code, _timeout):
+            return {
+                "code": code,
+                "purchaseStatusText": "限大额",
+                "purchaseStatusMark": "单日限额1000元",
+                "minPurchase": 1.0,
+                "maxPurchasePerDay": 1000.0,
+                "fundName": "测试基金",
+                "source": "eastmoney-fund-info",
+            }
 
         payload = fetch_fund_references(
-            codes,
-            client=client,
+            ["513100"],
             now=datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc),
+            fee_symbols=["513100"],
+            limit_symbols=["513100"],
+            fetch_fees=fetch_fees,
+            fetch_info=fetch_info,
         )
 
-        fee_calls = [call for call in calls if call[0] == "POST"]
-        limit_calls = [call for call in calls if call[0] == "GET"]
-        self.assertEqual([len(call[2]["codes"]) for call in fee_calls], [FEE_BATCH_SIZE, 1])
-        self.assertEqual(len(limit_calls), len(codes))
-        self.assertEqual(payload["fee_success_count"], len(codes))
-        self.assertEqual(payload["limit_success_count"], len(codes))
         self.assertEqual(payload["snapshot_date"], "2026-08-12")
-        self.assertEqual(len(payload["records"]), len(codes) * 2)
+        self.assertEqual(payload["fee_success_count"], 1)
+        self.assertEqual(payload["limit_success_count"], 1)
+        self.assertEqual(len(payload["records"]), 2)
+        self.assertEqual(payload["errors"], [])
+
+        fee_record = payload["records"][0]
+        self.assertEqual(fee_record["data_kind"], "fund_fee")
+        self.assertEqual(fee_record["source"], "direct:fund-fee")
+        self.assertEqual(fee_record["payload"]["managementFeeRate"], 0.8)
+        self.assertEqual(fee_record["payload"]["fundName"], "测试基金")
+
+        limit_record = payload["records"][1]
+        self.assertEqual(limit_record["data_kind"], "fund_limit")
+        self.assertEqual(limit_record["source"], "direct:fund-limit")
+        self.assertEqual(limit_record["payload"]["buyStatus"], "limit_large")
+        self.assertEqual(limit_record["payload"]["maxPurchasePerDay"], 1000.0)
+        self.assertEqual(limit_record["payload"]["channelLimits"], {"all": 1000.0})
+        self.assertEqual(limit_record["payload"]["limitSchemaVersion"], 2)
+
+    def test_limit_record_missing_when_status_unavailable(self) -> None:
+        payload = fetch_fund_references(
+            ["000003"],
+            now=datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc),
+            limit_symbols=["000003"],
+            fetch_fees=lambda code, _timeout: None,
+            fetch_info=lambda code, _timeout: None,
+        )
+        self.assertEqual(payload["limit_success_count"], 0)
+        self.assertEqual(payload["limit_failure_count"], 1)
+        self.assertTrue(any("fund_limit:000003" in error for error in payload["errors"]))
 
     def test_daily_slot_is_due_after_time_and_only_once(self) -> None:
         completed = set()
@@ -96,7 +133,7 @@ class FundReferenceTest(unittest.TestCase):
                     "symbol": "000001",
                     "snapshot_date": "2026-08-12",
                     "fetched_at": "2026-08-12T22:31:00+08:00",
-                    "source": "worker:fund-fee",
+                    "source": "direct:fund-fee",
                     "payload": {"code": "000001"},
                 }],
                 "requested_symbols": 1,
