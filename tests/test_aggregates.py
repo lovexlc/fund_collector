@@ -127,6 +127,25 @@ class AggregateServiceTest(unittest.TestCase):
         self.assertEqual(payload["candles"][0]["o"], 2.1)
         self.assertEqual(payload["candles"][0]["c"], 2.14)
 
+    def test_home_series_uses_latest_day_one_minute_and_complete_groups(self) -> None:
+        older = (datetime.fromisoformat(RECENT_DAY) - timedelta(days=1)).date().isoformat()
+        old = record(f"{older}T14:59:00+08:00", 1.9, 1.8, 5.5555)
+        self.store.write_cycle([old], 168, 14)
+
+        payload = self.service.home_series()
+
+        self.assertEqual(payload["tradingDate"], RECENT_DAY)
+        self.assertEqual(payload["bucketMinutes"], 1)
+        self.assertEqual(
+            [group["key"] for group in payload["groups"]],
+            ["all", "nasdaq-100", "sp500", "us-50", "nasdaq-tech"],
+        )
+        series = next(item for item in payload["modes"]["premium"]["series"] if item["code"] == "513100")
+        self.assertEqual(len(series["points"]), 3)
+        self.assertTrue(all(point["time"].startswith(RECENT_DAY) for point in series["points"]))
+        self.assertEqual(payload["yesterday"]["tradingDate"], older)
+        self.assertEqual(payload["yesterday"]["premiumMedianPercent"], 5.5555)
+
     def test_daily_combines_price_nav_and_t_minus_one_premium(self) -> None:
         payload = self.service.daily_combined("513100", 10)
         self.assertEqual(len(payload["candles"]), 2)
