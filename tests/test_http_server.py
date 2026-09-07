@@ -34,6 +34,15 @@ class FakeMarketDataService:
             for code in symbols if code == "513100"
         ]
 
+    def home_overview(self):
+        return {"marketState": "open"}
+
+    def home_series(self):
+        return {"modes": {"price": {}, "premium": {}}}
+
+    def fund_limit_overview(self):
+        return {"currencyTotals": [], "events": []}
+
     def kline(self, symbol: str, interval: str, limit: int):
         return {
             "symbol": symbol,
@@ -292,6 +301,23 @@ class HttpServerTest(unittest.TestCase):
         )
         self.assertEqual(status, 503)
         self.assertEqual(payload["error"], "cache_miss")
+
+    def test_home_aggregate_routes_are_local(self) -> None:
+        service = FakeMarketDataService()
+        for route in (
+            "/api/market-collector/aggregates/home-market-overview",
+            "/api/market-collector/aggregates/home-market-series",
+            "/api/market-collector/aggregates/fund-limit-overview",
+        ):
+            status, payload = resolve_request(route, self.data_dir, service, proxy_request=lambda *_: self.fail("must not proxy"))
+            self.assertEqual(status, 200)
+            self.assertIsInstance(payload, dict)
+        status, payload = resolve_request(
+            "/api/market-collector/aggregates/home-market-collect", self.data_dir, service,
+            proxy_request=lambda *_: self.fail("must not proxy"),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["source"], "market-collector-local")
 
 
 if __name__ == "__main__":
