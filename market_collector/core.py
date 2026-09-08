@@ -644,6 +644,7 @@ class MarketCollector:
             summary['totalByCurrency'] = latest_totals
             payload['summary'] = summary
             print(f"[fund-store] replaced limit trend: {len(collector_trend)} days, totals={latest_totals}", flush=True)
+        atomic_write_json(Path(str(self.config["output_dir"])) / "fund-limit-overview.json", payload)
         return self.fund_store.upsert_limit_overview(payload)
 
     def _fetch_nav_history_rows(self, codes: list[str]) -> list[dict[str, Any]]:
