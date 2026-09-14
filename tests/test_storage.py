@@ -213,6 +213,19 @@ class StorageTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "payload code mismatch"):
                 store.write_fund_reference_snapshots([wrong_code], retention_days=400)
 
+    def test_fund_reference_write_accepts_direct_source(self) -> None:
+        """直连采集（东财/蛋卷）的 direct:* 快照必须可写，读取路径两种前缀都认。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = SQLiteStore(str(Path(temp_dir) / "collector.sqlite3"))
+            store.initialize()
+            direct = fund_reference("fund_fee", "000001")
+            direct["source"] = "direct:fund-fee"
+            store.write_fund_reference_snapshots([direct], retention_days=400)
+            self.assertEqual(
+                store.read_latest_fund_references("fund_fee", ["000001"]),
+                {"000001": direct["payload"]},
+            )
+
     def test_build_store_defaults_to_sqlite_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = str(Path(temp_dir) / "collector.sqlite3")

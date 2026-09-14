@@ -58,9 +58,11 @@ def validate_fund_reference_record(record: Mapping[str, Any]) -> tuple[str, str,
     except ValueError as exc:
         raise ValueError(f"invalid fund reference snapshot_date: {snapshot_date!r}") from exc
     fetched_at = canonical_timestamp(str(record.get("fetched_at") or ""))
-    expected_source = "worker:" + data_kind.replace("_", "-")
+    # 历史 source 为 worker:*，直连采集（东财/蛋卷）后为 direct:*；
+    # 读取路径两种前缀都认，校验保持一致。
     source = str(record.get("source") or "")
-    if source != expected_source:
+    kind_slug = data_kind.replace("_", "-")
+    if source not in (f"worker:{kind_slug}", f"direct:{kind_slug}"):
         raise ValueError(f"invalid fund reference source for {data_kind}: {source!r}")
     payload = record.get("payload")
     if not isinstance(payload, dict):
