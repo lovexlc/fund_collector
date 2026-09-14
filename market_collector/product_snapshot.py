@@ -25,6 +25,7 @@ _PRODUCT_COLUMNS = (
     "drawdown_percentile", "high_drawdown", "close_high_drawdown",
     "high_point", "high_point_date", "close_high_point",
     "close_high_point_date", "summary_updated_at",
+    "detail_total_shares", "detail_fund_size",
 )
 
 # Daily fund_summary metrics served only by the local product tables.  The
@@ -95,6 +96,8 @@ def normalize_product_row(row: dict[str, Any]) -> dict[str, Any]:
         "drawdownPercentile": row.get("drawdown_percentile"),
         "highDrawdown": row.get("high_drawdown"),
         "closeHighDrawdown": row.get("close_high_drawdown"),
+        "totalShares": row.get("detail_total_shares"),
+        "fundSize": row.get("detail_fund_size"),
         "updatedAt": updated_at,
         "source": "fund-collector-products",
     }
@@ -136,7 +139,8 @@ class FundProductStore(FundStore):
   s.return_1w,s.return_1m,s.return_3m,s.return_6m,s.return_1y,
   s.return_base,s.ytd_return,s.historical_percentile,s.drawdown_percentile,
   s.high_drawdown,s.close_high_drawdown,s.high_point,s.high_point_date,
-  s.close_high_point,s.close_high_point_date,s.updated_at AS summary_updated_at
+  s.close_high_point,s.close_high_point_date,s.updated_at AS summary_updated_at,
+  d.total_shares AS detail_total_shares, d.fund_size AS detail_fund_size
 FROM fund_quote q
 LEFT JOIN (
   SELECT s1.code, s1.date, s1.latest_nav,
@@ -152,7 +156,8 @@ LEFT JOIN (
     FROM fund_summary
     GROUP BY code
   ) latest ON latest.code = s1.code AND latest.max_date = s1.date
-) s ON s.code = q.code"""
+) s ON s.code = q.code
+LEFT JOIN fund_detail d ON d.code = q.code"""
         try:
             # FundStore uses a shared non-autocommit connection.  Serialize the
             # complete read and end the previous snapshot before selecting so

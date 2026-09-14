@@ -461,6 +461,7 @@ class MarketCollector:
                 "redeem_rules": fee.get("redeemRules"),
                 "operation_fees": fee.get("operationFees"),
                 "fund_size": fee.get("fundSize"),
+                "total_shares": fee.get("fundShares"),
             })
         return self.fund_store.upsert_details(rows)
 

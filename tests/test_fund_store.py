@@ -65,15 +65,20 @@ class FundDetailUpsertTest(unittest.TestCase):
             "limit_channel": "app",
             "limit_channel_text": "本公司直销机构",
             "limit_schema_version": 2,
+            "fund_size": 19468268721.53,
+            "total_shares": 9465110600.0,
         }])
         self.assertEqual(n, 1)
         sql, rows = cursor.calls[0]
         self.assertIn("channel_limits", sql)
         self.assertIn("limit_channel_text", sql)
+        self.assertIn("total_shares", sql)
         self.assertEqual(json.loads(rows[0][10]), {"direct": 100, "distributor": 10})
         self.assertEqual(rows[0][11], "app")
         self.assertEqual(rows[0][12], "本公司直销机构")
         self.assertEqual(rows[0][13], 2)
+        self.assertEqual(rows[0][23], 19468268721.53)
+        self.assertEqual(rows[0][24], 9465110600.0)
 
 
 class FundHistoryUpsertTest(unittest.TestCase):

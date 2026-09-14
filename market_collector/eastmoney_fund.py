@@ -60,6 +60,38 @@ def _strip_tags(html: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+def _parse_html_tables(html: str) -> list[list[list[str]]]:
+    """HTML 表格 → 行列表（每行是去标签后的非空单元格），与旧 worker 的 extractTables 同构。"""
+    tables: list[list[list[str]]] = []
+    for table_html in re.findall(r"<table\b[\s\S]*?</table>", html, flags=re.I):
+        rows: list[list[str]] = []
+        for tr in re.findall(r"<tr\b[\s\S]*?</tr>", table_html, flags=re.I):
+            cells = [_strip_tags(cell) for cell in re.findall(r"<t[dh][^>]*>([\s\S]*?)</t[dh]>", tr, flags=re.I)]
+            cells = [cell for cell in cells if cell]
+            if cells:
+                rows.append(cells)
+        if rows:
+            tables.append(rows)
+    return tables
+
+
+def _fee_tier_rows(tables: list[list[list[str]]], keyword: str) -> list[list[str]]:
+    """从表格里提取费率阶梯行（如 赎回费率：[\"小于7天\", \"1.50%\"]）。
+
+    只保留含百分数的行，表头（适用期限/赎回费率 等）自然被过滤。
+    """
+    for rows in tables:
+        if not any(keyword in " ".join(row) for row in rows):
+            continue
+        tiers = [
+            row for row in rows
+            if any(re.search(r"\d+(?:\.\d+)?\s*[%％]", cell) for cell in row)
+        ]
+        if tiers:
+            return tiers
+    return []
+
+
 def _normalize_code(code: Any) -> str:
     text = str(code or "").strip()
     return text if text.isdigit() and len(text) == 6 else ""
@@ -115,15 +147,15 @@ def fetch_f10_fees(
             "赎回状态", redeem_status or "—",
             "定投状态", invest_status or "—",
         ])
+    # 卖出费率阶梯：[持有期限, "1.50%"] 行，前端 resolveRedeemFeeRate 取 max。
+    rules.extend(_fee_tier_rows(_parse_html_tables(html), "赎回费率"))
     operation_fees: list[list[str]] = []
-    parts: list[str] = []
+    # 每项费率一行：前端 combineRuleRates 对每行只取一个百分数再求和，
+    # 三项挤一行会只剩管理费。
     for label, key in (("管理费率", "managementFeeRate"), ("托管费率", "custodyFeeRate"), ("销售服务费率", "salesServiceFeeRate")):
         value = rates.get(key)
         if value is not None:
-            parts.append(label)
-            parts.append(f"{value:.2f}%（每年）")
-    if parts:
-        operation_fees.append(parts)
+            operation_fees.append([label, f"{value:.2f}%（每年）"])
     management = rates.get("managementFeeRate")
     custody = rates.get("custodyFeeRate")
     sales = rates.get("salesServiceFeeRate")
@@ -171,6 +203,10 @@ def fetch_fund_info(
         "minPurchase": _positive_float(data.get("MINSG")),
         "maxPurchasePerDay": _positive_float(data.get("MAXSG")),
         "fundName": str(data.get("SHORTNAME") or data.get("FUNDNAME") or "").strip() or None,
+        # FEGM 基金份额（总份额）/ ENDNAV 资产净值（规模），行情中心的份额/规模数据源。
+        "fundShares": _positive_float(data.get("FEGM")),
+        "fundSize": _positive_float(data.get("ENDNAV")),
+        "fundSharesAsOf": str(data.get("FEGMRQ") or "").strip()[:10] or None,
         "source": "eastmoney-fund-info",
     }
 

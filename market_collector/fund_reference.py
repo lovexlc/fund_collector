@@ -89,15 +89,20 @@ def _snapshot_record(
 def _build_fee_payload(
     code: str,
     fee_data: dict[str, Any],
+    fund_info: dict[str, Any] | None,
     fund_name: str | None,
     fetched_at: str,
 ) -> dict[str, Any]:
+    info = fund_info or {}
     return {
         "annualFeeRate": fee_data.get("annualFeeRate"),
         "code": code,
         "custodyFeeRate": fee_data.get("custodyFeeRate"),
         "fetchedAt": fetched_at,
         "fundName": fund_name,
+        "fundShares": info.get("fundShares"),
+        "fundSharesAsOf": info.get("fundSharesAsOf"),
+        "fundSize": info.get("fundSize"),
         "managementFeeRate": fee_data.get("managementFeeRate"),
         "operationFeeRate": fee_data.get("operationFeeRate"),
         "operationFees": fee_data.get("operationFees") or [],
@@ -126,16 +131,19 @@ def _fetch_code_records(
         fee_data = fetch_fees(code, timeout_sec)
         if not isinstance(fee_data, dict):
             errors.append(f"fund_fee:{code}: eastmoney f10 unavailable")
-    if want_limit:
+    # fund_info 除限购外还提供 FEGM 总份额/ENDNAV 规模，fee 通道（含场内 ETF）也需要。
+    if want_fee or want_limit:
         info = fetch_info(code, timeout_sec)
-        if not isinstance(info, dict):
-            errors.append(f"fund_limit:{code}: eastmoney fund info unavailable")
+    if want_limit and not isinstance(info, dict):
+        errors.append(f"fund_limit:{code}: eastmoney fund info unavailable")
+    if want_fee and not want_limit and not isinstance(info, dict):
+        errors.append(f"fund_fee:{code}: fund shares unavailable")
     fund_name = str((info or {}).get("fundName") or "") or None
     if want_fee:
         if isinstance(fee_data, dict):
             records.append(_snapshot_record(
                 "fund_fee", code,
-                _build_fee_payload(code, fee_data, fund_name, fetched_at),
+                _build_fee_payload(code, fee_data, info, fund_name, fetched_at),
                 fetched_at, snapshot_date,
             ))
     if want_limit:
@@ -168,11 +176,18 @@ def fetch_fund_references(
     snapshot_date = current.date().isoformat()
     # 默认 fee/limit 同 symbols；分别传入时可拆开：场内 ETF 只抓 fee（持有成本费率），
     # 场外 OTC 两样都抓（fee 含卖出费率 redeemRules，limit 含限购额度）。
+    # 显式传空列表 = 该通道不同步（区别于 None 的“同 symbols”）。
     fee_codes = list(dict.fromkeys(
-        code for code in (normalize_fund_code(symbol) for symbol in (fee_symbols or symbols)) if code
+        code for code in (
+            normalize_fund_code(symbol)
+            for symbol in (fee_symbols if fee_symbols is not None else symbols)
+        ) if code
     ))
     limit_codes = list(dict.fromkeys(
-        code for code in (normalize_fund_code(symbol) for symbol in (limit_symbols or symbols)) if code
+        code for code in (
+            normalize_fund_code(symbol)
+            for symbol in (limit_symbols if limit_symbols is not None else symbols)
+        ) if code
     ))
     fee_set = set(fee_codes)
     limit_set = set(limit_codes)

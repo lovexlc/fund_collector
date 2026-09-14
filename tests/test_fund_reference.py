@@ -59,6 +59,9 @@ class FundReferenceTest(unittest.TestCase):
                 "minPurchase": 1.0,
                 "maxPurchasePerDay": 1000.0,
                 "fundName": "测试基金",
+                "fundShares": 9465110600.0,
+                "fundSize": 19468268721.53,
+                "fundSharesAsOf": "2026-06-30",
                 "source": "eastmoney-fund-info",
             }
 
@@ -82,6 +85,9 @@ class FundReferenceTest(unittest.TestCase):
         self.assertEqual(fee_record["source"], "direct:fund-fee")
         self.assertEqual(fee_record["payload"]["managementFeeRate"], 0.8)
         self.assertEqual(fee_record["payload"]["fundName"], "测试基金")
+        self.assertEqual(fee_record["payload"]["fundShares"], 9465110600.0)
+        self.assertEqual(fee_record["payload"]["fundSize"], 19468268721.53)
+        self.assertEqual(fee_record["payload"]["fundSharesAsOf"], "2026-06-30")
 
         limit_record = payload["records"][1]
         self.assertEqual(limit_record["data_kind"], "fund_limit")
@@ -102,6 +108,65 @@ class FundReferenceTest(unittest.TestCase):
         self.assertEqual(payload["limit_success_count"], 0)
         self.assertEqual(payload["limit_failure_count"], 1)
         self.assertTrue(any("fund_limit:000003" in error for error in payload["errors"]))
+
+    def test_fee_only_symbol_carries_shares_from_fund_info(self) -> None:
+        """场内 ETF 只有 fee 通道，也要抓 fund_info 拿总份额/规模。"""
+
+        def fetch_fees(code, _timeout):
+            return {
+                "code": code,
+                "managementFeeRate": 0.6,
+                "custodyFeeRate": 0.2,
+                "salesServiceFeeRate": None,
+                "annualFeeRate": 0.8,
+                "operationFees": [["管理费率", "0.60%（每年）"]],
+                "redeemRules": [],
+                "source": "eastmoney-f10",
+            }
+
+        def fetch_info(code, _timeout):
+            return {
+                "code": code,
+                "purchaseStatusText": "场内交易",
+                "fundShares": 9465110600.0,
+                "fundSize": 19468268721.53,
+                "source": "eastmoney-fund-info",
+            }
+
+        payload = fetch_fund_references(
+            ["513100"],
+            now=datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc),
+            fee_symbols=["513100"],
+            limit_symbols=[],
+            fetch_fees=fetch_fees,
+            fetch_info=fetch_info,
+        )
+        self.assertEqual(payload["fee_success_count"], 1)
+        self.assertEqual(payload["limit_success_count"], 0)
+        self.assertEqual(payload["errors"], [])
+        fee_payload = payload["records"][0]["payload"]
+        self.assertEqual(fee_payload["fundShares"], 9465110600.0)
+        self.assertEqual(fee_payload["fundSize"], 19468268721.53)
+        self.assertEqual(fee_payload["managementFeeRate"], 0.6)
+
+    def test_fee_only_symbol_reports_missing_shares_when_info_fails(self) -> None:
+        payload = fetch_fund_references(
+            ["513100"],
+            now=datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc),
+            fee_symbols=["513100"],
+            limit_symbols=[],
+            fetch_fees=lambda code, _timeout: {
+                "code": code,
+                "managementFeeRate": 0.6,
+                "annualFeeRate": 0.8,
+                "operationFees": [],
+                "redeemRules": [],
+            },
+            fetch_info=lambda code, _timeout: None,
+        )
+        # 费率照常落库，份额缺失只记一条错误
+        self.assertEqual(payload["fee_success_count"], 1)
+        self.assertTrue(any("fund shares unavailable" in error for error in payload["errors"]))
 
     def test_daily_slot_is_due_after_time_and_only_once(self) -> None:
         completed = set()

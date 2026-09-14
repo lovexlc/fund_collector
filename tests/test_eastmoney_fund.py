@@ -22,6 +22,12 @@ F10_HTML = """
 <tr><td>赎回状态</td><td>开放赎回</td></tr>
 <tr><td>定投状态</td><td>不支持</td></tr>
 </table>
+<table>
+<tr><td>适用期限</td><td>赎回费率</td></tr>
+<tr><td>小于7天</td><td>1.50%</td></tr>
+<tr><td>大于等于7天，小于1年</td><td>0.50%</td></tr>
+<tr><td>大于等于1年</td><td>0.00%</td></tr>
+</table>
 </body></html>
 """
 
@@ -32,6 +38,9 @@ FUND_INFO_PAYLOAD = {
         "MINSG": "1",
         "MAXSG": "1000",
         "SHORTNAME": "纳指ETF联接",
+        "FEGM": "9465110600",
+        "ENDNAV": "19468268721.53",
+        "FEGMRQ": "2026-06-30 00:00:00",
     },
     "ErrCode": 0,
 }
@@ -46,7 +55,19 @@ class EastmoneyFundTest(unittest.TestCase):
         self.assertEqual(fees["annualFeeRate"], 1.0)
         self.assertEqual(fees["purchaseStatusText"], "限大额")
         self.assertEqual(fees["redeemStatusText"], "开放赎回")
-        self.assertEqual(fees["operationFees"][0][0], "管理费率")
+        # 每项费率一行：前端 combineRuleRates 每行只取一个百分数再求和
+        self.assertEqual(fees["operationFees"], [
+            ["管理费率", "0.80%（每年）"],
+            ["托管费率", "0.20%（每年）"],
+            ["销售服务费率", "0.00%（每年）"],
+        ])
+        # 申赎状态行在前，赎回费率阶梯行随后（表头被过滤）
+        self.assertEqual(fees["redeemRules"], [
+            ["申购状态", "限大额", "赎回状态", "开放赎回", "定投状态", "不支持"],
+            ["小于7天", "1.50%"],
+            ["大于等于7天，小于1年", "0.50%"],
+            ["大于等于1年", "0.00%"],
+        ])
         self.assertEqual(fees["source"], "eastmoney-f10")
 
     def test_fetch_f10_fees_returns_none_when_no_rates(self) -> None:
@@ -60,6 +81,9 @@ class EastmoneyFundTest(unittest.TestCase):
         self.assertEqual(info["maxPurchasePerDay"], 1000.0)
         self.assertEqual(info["minPurchase"], 1.0)
         self.assertEqual(info["fundName"], "纳指ETF联接")
+        self.assertEqual(info["fundShares"], 9465110600.0)
+        self.assertEqual(info["fundSize"], 19468268721.53)
+        self.assertEqual(info["fundSharesAsOf"], "2026-06-30")
 
     def test_build_limit_payload_maps_status_and_amount(self) -> None:
         info = fetch_fund_info("000055", fetch_json=lambda _url, _timeout: FUND_INFO_PAYLOAD)

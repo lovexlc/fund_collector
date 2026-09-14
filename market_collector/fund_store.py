@@ -141,6 +141,7 @@ class FundStore:
   redeem_rules JSON NULL,
   operation_fees JSON NULL,
   fund_size DOUBLE NULL,
+  total_shares DOUBLE NULL,
   updated_at VARCHAR(35) NULL,
   KEY idx_exchange (exchange)
 )"""
@@ -218,6 +219,7 @@ class FundStore:
                 "ALTER TABLE fund_detail ADD COLUMN limit_channel_text TEXT NULL",
                 "ALTER TABLE fund_detail MODIFY COLUMN limit_channel_text TEXT NULL",
                 "ALTER TABLE fund_detail ADD COLUMN limit_schema_version INT NOT NULL DEFAULT 2",
+                "ALTER TABLE fund_detail ADD COLUMN total_shares DOUBLE NULL",
             ):
                 try:
                     with conn.cursor() as alter_cursor:
@@ -384,10 +386,10 @@ ON DUPLICATE KEY UPDATE name=VALUES(name),price=VALUES(price),latest_nav=VALUES(
                 _num(r.get("annual_fee_rate")), _num(r.get("sales_service_fee_rate")),
                 _num(r.get("redeem_fee_rate")),
                 _json_or_none(r.get("redeem_rules")), _json_or_none(r.get("operation_fees")),
-                _num(r.get("fund_size")), now,
+                _num(r.get("fund_size")), _num(r.get("total_shares")), now,
             ))
-        sql = """INSERT INTO fund_detail (code,name,full_name,fund_type,exchange,region,currency,buy_status,buy_status_text,max_purchase_per_day,channel_limits,limit_channel,limit_channel_text,limit_schema_version,min_purchase,confirm_days,management_fee_rate,custody_fee_rate,annual_fee_rate,sales_service_fee_rate,redeem_fee_rate,redeem_rules,operation_fees,fund_size,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-ON DUPLICATE KEY UPDATE name=VALUES(name),full_name=VALUES(full_name),fund_type=VALUES(fund_type),exchange=VALUES(exchange),region=VALUES(region),currency=VALUES(currency),buy_status=VALUES(buy_status),buy_status_text=VALUES(buy_status_text),max_purchase_per_day=VALUES(max_purchase_per_day),channel_limits=VALUES(channel_limits),limit_channel=VALUES(limit_channel),limit_channel_text=VALUES(limit_channel_text),limit_schema_version=VALUES(limit_schema_version),min_purchase=VALUES(min_purchase),confirm_days=VALUES(confirm_days),management_fee_rate=VALUES(management_fee_rate),custody_fee_rate=VALUES(custody_fee_rate),annual_fee_rate=VALUES(annual_fee_rate),sales_service_fee_rate=VALUES(sales_service_fee_rate),redeem_fee_rate=VALUES(redeem_fee_rate),redeem_rules=VALUES(redeem_rules),operation_fees=VALUES(operation_fees),fund_size=VALUES(fund_size),updated_at=VALUES(updated_at)"""
+        sql = """INSERT INTO fund_detail (code,name,full_name,fund_type,exchange,region,currency,buy_status,buy_status_text,max_purchase_per_day,channel_limits,limit_channel,limit_channel_text,limit_schema_version,min_purchase,confirm_days,management_fee_rate,custody_fee_rate,annual_fee_rate,sales_service_fee_rate,redeem_fee_rate,redeem_rules,operation_fees,fund_size,total_shares,updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+ON DUPLICATE KEY UPDATE name=VALUES(name),full_name=VALUES(full_name),fund_type=VALUES(fund_type),exchange=VALUES(exchange),region=VALUES(region),currency=VALUES(currency),buy_status=VALUES(buy_status),buy_status_text=VALUES(buy_status_text),max_purchase_per_day=VALUES(max_purchase_per_day),channel_limits=VALUES(channel_limits),limit_channel=VALUES(limit_channel),limit_channel_text=VALUES(limit_channel_text),limit_schema_version=VALUES(limit_schema_version),min_purchase=VALUES(min_purchase),confirm_days=VALUES(confirm_days),management_fee_rate=VALUES(management_fee_rate),custody_fee_rate=VALUES(custody_fee_rate),annual_fee_rate=VALUES(annual_fee_rate),sales_service_fee_rate=VALUES(sales_service_fee_rate),redeem_fee_rate=VALUES(redeem_fee_rate),redeem_rules=VALUES(redeem_rules),operation_fees=VALUES(operation_fees),fund_size=VALUES(fund_size),total_shares=VALUES(total_shares),updated_at=VALUES(updated_at)"""
         return self._safe_executemany(sql, mapped, "fund_detail")
 
     # ---- fund_history（增量 append）----

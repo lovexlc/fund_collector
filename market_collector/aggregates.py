@@ -687,27 +687,36 @@ class MarketDataService:
             metric = metrics[0]
         nav_date = str(metric.get("latestNavDate") or "")[:10]
         exchange = "SH" if normalized.startswith(("5", "6")) else "SZ"
-        premium = _number(item.get("vendor_premium_percent"))
-        if premium is None:
-            premium = _number(item.get("computed_premium_percent"))
+
+        def field(*keys: str) -> Any:
+            # 产品表行是 camelCase（normalize_product_row），shadow 记录是 snake_case；
+            # 两种键都接受，产品表覆盖的代码也能拼出完整 quote。
+            for key in keys:
+                value = item.get(key)
+                if value is not None:
+                    return value
+            return None
+
+        premium = _number(field("vendor_premium_percent", "computed_premium_percent", "premiumPercent"))
         quote: dict[str, Any] = {
             "symbol": exchange + normalized,
             "code": normalized,
             "name": str(item.get("name") or normalized),
             "current": price,
-            "last_close": _number(item.get("previous_close")),
+            "last_close": _number(field("previousClose", "previous_close")),
             "chg": _number(item.get("change")),
-            "percent": _number(item.get("change_percent")),
-            "open": _number(item.get("open")),
-            "high": _number(item.get("high")),
-            "low": _number(item.get("low")),
-            "volume": _number(item.get("volume")),
-            "amount": _number(item.get("turnover")),
+            "percent": _number(field("changePercent", "change_percent")),
+            "open": _number(field("open")),
+            "high": _number(field("high")),
+            "low": _number(field("low")),
+            "volume": _number(field("volume")),
+            "amount": _number(field("turnover")),
             "iopv": _number(metric.get("iopv")),
             "unit_nav": _number(metric.get("latestNav")),
             "nav_date": _date_epoch(nav_date) * 1000 if nav_date else None,
             "premium_rate": premium,
-            "current_year_percent": _number(item.get("current_year_percent")),
+            "current_year_percent": _number(field("currentYearPercent", "current_year_percent")),
+            "total_shares": _number(field("totalShares", "total_shares")),
             "high52w": None,
             "low52w": None,
             "currency": "CNY",
@@ -716,7 +725,7 @@ class MarketDataService:
             "timestamp": None,
         }
         try:
-            collected_at = str(item.get("collected_at") or "")
+            collected_at = str(item.get("collected_at") or item.get("asOf") or "")
             if collected_at:
                 quote["timestamp"] = int(parse_iso(collected_at).timestamp() * 1000)
         except Exception:
