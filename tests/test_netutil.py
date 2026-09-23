@@ -28,6 +28,35 @@ class NetutilTest(unittest.TestCase):
         self.assertIn("push2his.eastmoney.com", request.full_url)
         self.assertEqual(timeout, 5.0)
 
+    def test_eastmoney_proxy_retries_then_raises_last_error(self) -> None:
+        # 轮换出口 IP 池：连续抽到被封 IP 时重试到上限后抛最后一个错误。
+        def fail(_request, _timeout):
+            raise OSError("banned egress draw")
+
+        with patch.object(netutil, "_open_direct", side_effect=fail), \
+                patch.object(netutil, "_open_via_proxy", side_effect=fail) as via_proxy:
+            with self.assertRaises(OSError):
+                netutil.fetch_url("https://push2.eastmoney.com/api/qt/ulist.np/get", 5.0)
+        self.assertEqual(via_proxy.call_count, netutil.PROXY_RETRY_ATTEMPTS)
+
+    def test_eastmoney_proxy_retry_succeeds_on_later_attempt(self) -> None:
+        attempts = {"count": 0}
+
+        def flaky(_request, _timeout):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise OSError("banned egress draw")
+            return b"proxy-ok"
+
+        def direct_fail(_request, _timeout):
+            raise OSError("datacenter IP blocked")
+
+        with patch.object(netutil, "_open_direct", side_effect=direct_fail), \
+                patch.object(netutil, "_open_via_proxy", side_effect=flaky):
+            result = netutil.fetch_url("https://push2.eastmoney.com/api/qt/ulist.np/get", 5.0)
+        self.assertEqual(result, b"proxy-ok")
+        self.assertEqual(attempts["count"], 3)
+
     def test_non_fallback_host_raises_after_direct_failure(self) -> None:
         def fail(_request, _timeout):
             raise OSError("blocked")
