@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
-from market_collector.sources import parse_eastmoney_list_payload, parse_tencent_quote_text
+from market_collector.sources import (
+    EASTMONEY_LIST_URL,
+    EASTMONEY_ULIST_URL,
+    fetch_eastmoney_references,
+    parse_eastmoney_list_payload,
+    parse_tencent_quote_text,
+)
 
 
 class SourceParserTest(unittest.TestCase):
@@ -16,6 +25,40 @@ class SourceParserTest(unittest.TestCase):
         self.assertEqual(result["513100"]["volume"], 571425)
         self.assertEqual(result["513100"]["source"], "tencent_batch")
         self.assertEqual(result["513100"]["source_as_of"], "2026-08-11T14:55:01+08:00")
+
+    def test_eastmoney_clist_retry_then_ulist_fallback(self) -> None:
+        calls: list[str] = []
+
+        def fetch(url: str, timeout_sec: float) -> bytes:
+            calls.append(url)
+            if url.startswith(EASTMONEY_LIST_URL):
+                raise HTTPError(url, 502, "Bad Gateway", {}, None)
+            return json.dumps({
+                "data": {
+                    "diff": [{
+                        "f12": "161130",
+                        "f14": "纳斯达克100指数发起(QDII)A人民币",
+                        "f2": 1.234,
+                        "f3": 0.5,
+                        "f124": 20260923093000,
+                        "f402": -7.25,
+                        "f441": "",
+                    }]
+                }
+            }).encode("utf-8")
+
+        with patch("market_collector.sources.time.sleep") as sleep:
+            found, metadata = fetch_eastmoney_references(
+                ["161130"], 5, fetch_bytes=fetch
+            )
+
+        self.assertEqual(found["161130"]["vendor_premium_percent"], 7.25)
+        self.assertEqual(found["161130"]["source"], "eastmoney_push2delay")
+        self.assertEqual(sum(url.startswith(EASTMONEY_LIST_URL) for url in calls), 3)
+        self.assertEqual(sum(url.startswith(EASTMONEY_ULIST_URL) for url in calls), 1)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(metadata["missing_symbols"], [])
+        self.assertIn("clist_error", metadata)
 
     def test_parse_eastmoney_sign_corrects_vendor_premium(self) -> None:
         payload = {
