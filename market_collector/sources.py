@@ -4,6 +4,7 @@ import codecs
 import json
 import math
 import re
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ EASTMONEY_ULIST_URL = "https://push2delay.eastmoney.com/api/qt/ulist.np/get"
 EASTMONEY_PUSH_TOKEN = "bd1d9ddb04089700cf9c27f6f7426281"
 EASTMONEY_FS = "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827"
 EASTMONEY_FIELDS = "f12,f14,f2,f3,f124,f402,f441"
+EASTMONEY_REQUEST_ATTEMPTS = 3
+EASTMONEY_RETRY_DELAY_SEC = 0.2
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
 QuoteFetcher = Callable[[str, float], bytes]
@@ -184,6 +187,27 @@ def fetch_tencent_quotes(symbols: list[str], timeout_sec: float, fetch_bytes: Qu
     return parse_tencent_quote_text(payload, captured_at)
 
 
+def fetch_eastmoney_json(
+    url: str,
+    timeout_sec: float,
+    fetch_bytes: QuoteFetcher,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
+    for attempt in range(EASTMONEY_REQUEST_ATTEMPTS):
+        try:
+            payload = json.loads(fetch_bytes(url, timeout_sec).decode("utf-8", "replace"))
+            if not isinstance(payload, dict):
+                raise ValueError("Eastmoney response is not a JSON object")
+            return payload
+        except Exception as exc:
+            last_error = exc
+            if attempt + 1 < EASTMONEY_REQUEST_ATTEMPTS:
+                time.sleep(EASTMONEY_RETRY_DELAY_SEC * (attempt + 1))
+    if last_error is None:
+        raise RuntimeError("Eastmoney request failed without an exception")
+    raise last_error
+
+
 def fetch_eastmoney_references(
     symbols: list[str],
     timeout_sec: float,
@@ -194,6 +218,7 @@ def fetch_eastmoney_references(
     found: dict[str, dict[str, Any]] = {}
     page = 1
     total = None
+    clist_error: str | None = None
     while wanted:
         params = urllib.parse.urlencode(
             {
@@ -210,7 +235,15 @@ def fetch_eastmoney_references(
             }
         )
         captured_at = isoformat_z(utc_now())
-        payload = json.loads(fetch_bytes(EASTMONEY_LIST_URL + "?" + params, timeout_sec).decode("utf-8", "replace"))
+        try:
+            payload = fetch_eastmoney_json(
+                EASTMONEY_LIST_URL + "?" + params,
+                timeout_sec,
+                fetch_bytes,
+            )
+        except Exception as exc:
+            clist_error = str(exc)
+            break
         page_rows = parse_eastmoney_list_payload(payload, captured_at, page)
         for symbol in list(wanted):
             row = page_rows.get(symbol)
@@ -238,7 +271,11 @@ def fetch_eastmoney_references(
             })
             captured_at = isoformat_z(utc_now())
             try:
-                payload = json.loads(fetch_bytes(EASTMONEY_ULIST_URL + "?" + params, timeout_sec).decode("utf-8", "replace"))
+                payload = fetch_eastmoney_json(
+                    EASTMONEY_ULIST_URL + "?" + params,
+                    timeout_sec,
+                    fetch_bytes,
+                )
             except Exception:
                 continue
             page_rows = parse_eastmoney_list_payload(payload, captured_at, 0)
@@ -247,4 +284,11 @@ def fetch_eastmoney_references(
                 if row:
                     found[symbol] = row
                     wanted.discard(symbol)
-    return found, {"page_size": page_size, "pages_visited": page, "missing_symbols": sorted(wanted)}
+    metadata: dict[str, Any] = {
+        "page_size": page_size,
+        "pages_visited": page,
+        "missing_symbols": sorted(wanted),
+    }
+    if clist_error:
+        metadata["clist_error"] = clist_error
+    return found, metadata
